@@ -3,12 +3,30 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
+  "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "dist:exe": "npm run build && electron-builder --win portable"
+  },
+  "build": {
+    "appId": "com.riddim004.endless-onslaught",
+    "productName": "Endless Onslaught",
+    "files": [
+      "dist/**",
+      "electron/**"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": "portable"
+    }
   },
   "devDependencies": {
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3",
     "typescript": "^5.4.5",
     "vite": "^5.2.11"
   }
