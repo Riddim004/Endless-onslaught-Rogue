@@ -62,7 +62,7 @@ const WEAPON_DEFS: WeaponDef[] = [
     maxLevel: 8,
     describe(level) {
       if (level === 1) return '自动向最近的敌人发射追踪飞弹。';
-      const bonuses = ['', '伤害 +40%', '弹射数 +1', '冷却 -20%', '穿透 +1', '伤害 +50%', '弹射数 +1', '冷却 -20%'];
+      const bonuses = ['', '伤害 +58%', '飞弹数 +1', '伤害 +47%、冷却 -24%、穿透 +1', '飞弹数 +1', '伤害 +46%', '飞弹数 +1、冷却 -26%', '伤害 +46%'];
       return bonuses[level - 1] ?? '威力提升。';
     },
     update(dt, ctx, inst) {
@@ -113,7 +113,7 @@ const WEAPON_DEFS: WeaponDef[] = [
     maxLevel: 8,
     describe(level) {
       if (level === 1) return '召唤在屏幕内乱飞的飞刀，击中触碰到的敌人。';
-      const bonuses = ['', '飞刀数 +1', '伤害 +35%', '冷却 -25%', '飞刀数 +1', '穿透 +2', '伤害 +50%', '飞刀数 +1'];
+      const bonuses = ['', '伤害 +56%', '冷却 -30%', '飞刀数 +1、伤害 +43%', '穿透 +2', '飞刀数 +1、伤害 +50%', '飞刀数 +1、冷却 -22%', '伤害 +23%、冷却 -11%'];
       return bonuses[level - 1] ?? '威力提升。';
     },
     update(dt, ctx, inst) {
@@ -160,7 +160,7 @@ const WEAPON_DEFS: WeaponDef[] = [
     maxLevel: 8,
     describe(level) {
       if (level === 1) return '召唤环绕自身旋转的能量法球，持续造成伤害。';
-      const bonuses = ['', '法球 +1', '伤害 +40%', '转速 +25%', '法球 +1', '范围 +20%', '伤害 +50%', '法球 +1'];
+      const bonuses = ['', '伤害 +67%', '法球 +1、转速 +29%', '伤害 +47%', '法球 +1、轨道范围 +29%', '伤害 +50%', '法球 +1', '伤害 +21%'];
       return bonuses[level - 1] ?? '威力提升。';
     },
     update(dt, ctx, inst) {
@@ -214,7 +214,7 @@ const WEAPON_DEFS: WeaponDef[] = [
     maxLevel: 8,
     describe(level) {
       if (level === 1) return '环绕自身的灼热领域，持续灼烧靠近的敌人。';
-      const bonuses = ['', '范围 +18%', '伤害 +40%', '灼烧频率 +25%', '范围 +18%', '伤害 +50%', '范围 +18%', '伤害 +50%'];
+      const bonuses = ['', '范围 +20%', '伤害 +67%', '灼烧频率 +29%', '范围 +18%', '伤害 +70%', '范围 +15%', '伤害 +29%、范围 +10%'];
       return bonuses[level - 1] ?? '威力提升。';
     },
     update(dt, ctx, inst) {
@@ -256,7 +256,7 @@ const WEAPON_DEFS: WeaponDef[] = [
     maxLevel: 8,
     describe(level) {
       if (level === 1) return '周期性向四周爆发一圈冰霜弹幕。';
-      const bonuses = ['', '弹幕 +3', '伤害 +40%', '冷却 -20%', '弹幕 +4', '穿透 +1', '伤害 +50%', '弹幕 +4'];
+      const bonuses = ['', '伤害 +50%', '弹幕 +2、冷却 -25%', '弹幕 +4、伤害 +47%', '穿透 +1', '弹幕 +2、伤害 +50%', '弹幕 +4、冷却 -17%', '弹幕 +4、伤害 +21%、冷却 -13%'];
       return bonuses[level - 1] ?? '威力提升。';
     },
     update(dt, ctx, inst) {
@@ -300,7 +300,7 @@ const WEAPON_DEFS: WeaponDef[] = [
     maxLevel: 8,
     describe(level) {
       if (level === 1) return '击中最近的敌人并在敌群间弹跳的闪电。';
-      const bonuses = ['', '跳数 +1', '伤害 +40%', '冷却 -20%', '跳数 +2', '伤害 +50%', '跳数 +2', '冷却 -25%'];
+      const bonuses = ['', '跳数 +1、伤害 +53%', '冷却 -23%', '跳数 +2、伤害 +38%', '伤害 +33%', '跳数 +2', '跳数 +1、冷却 -26%', '跳数 +1、伤害 +25%、冷却 -18%'];
       return bonuses[level - 1] ?? '威力提升。';
     },
     update(dt, ctx, inst) {
@@ -350,7 +350,7 @@ const WEAPON_DEFS: WeaponDef[] = [
     maxLevel: 8,
     describe(level) {
       if (level === 1) return '环绕自身的寒冰领域，减速并持续冰冻靠近的敌人。';
-      const bonuses = ['', '范围 +16%', '减速 +10%', '伤害 +40%', '范围 +16%', '减速 +10%', '伤害 +50%', '范围 +18%'];
+      const bonuses = ['', '减速 +10%、范围 +18%', '伤害 +80%', '减速 +6%、范围 +17%', '减速 +4%', '伤害 +78%', '减速 +10%、范围 +16%', '伤害 +38%、减速 +4%、范围 +13%'];
       return bonuses[level - 1] ?? '威力提升。';
     },
     update(dt, ctx, inst) {
@@ -396,7 +396,7 @@ const WEAPON_DEFS: WeaponDef[] = [
     maxLevel: 8,
     describe(level) {
       if (level === 1) return '在敌群中制造黑洞，牵引并减速敌人，同时造成范围伤害。';
-      const bonuses = ['', '范围 +20%', '伤害 +40%', '冷却 -20%', '持续 +0.6s', '牵引 +30%', '伤害 +50%', '冷却 -25%'];
+      const bonuses = ['', '伤害 +60%、范围 +24%', '冷却 -23%', '伤害 +50%、持续 +0.8s', '牵引 +53%', '伤害 +58%', '冷却 -26%、范围 +21%', '伤害 +32%、冷却 -18%、范围 +7%'];
       return bonuses[level - 1] ?? '威力提升。';
     },
     update(dt, ctx, inst) {
@@ -441,7 +441,7 @@ const WEAPON_DEFS: WeaponDef[] = [
     maxLevel: 8,
     describe(level) {
       if (level === 1) return '周期性释放冲击波，击退并短暂眩晕范围内的敌人。';
-      const bonuses = ['', '范围 +18%', '伤害 +40%', '冷却 -18%', '范围 +18%', '眩晕 +0.15s', '伤害 +50%', '冷却 -20%'];
+      const bonuses = ['', '伤害 +57%、范围 +10%', '冷却 -20%、范围 +13%', '伤害 +45%', '冷却 -13%', '伤害 +50%、范围 +16%、眩晕 +0.2s', '冷却 -19%', '伤害 +29%、范围 +11%、冷却 -18%'];
       return bonuses[level - 1] ?? '威力提升。';
     },
     update(dt, ctx, inst) {

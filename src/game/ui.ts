@@ -2,6 +2,7 @@
 
 import { Choice } from './skills';
 import { formatTime } from './math';
+import { GAME_MODES, GameMode, MAPS, MapId } from './config';
 
 export interface HudData {
   hp: number;
@@ -12,6 +13,8 @@ export interface HudData {
   time: number;
   kills: number;
   tray: { icon: string; level: number }[];
+  /** 限时模式：剩余秒数（存在时时间栏显示倒计时） */
+  countdown?: number;
 }
 
 export interface GameOverData {
@@ -80,7 +83,8 @@ export class UI {
     this.hpFill.style.transform = `scaleX(${Math.max(0, d.hp / d.maxHp)})`;
     this.hpLabel.textContent = `${Math.ceil(Math.max(0, d.hp))} / ${d.maxHp}`;
     this.xpFill.style.transform = `scaleX(${Math.max(0, Math.min(1, d.xp / d.xpToNext))})`;
-    this.timeEl.textContent = formatTime(d.time);
+    this.timeEl.textContent =
+      d.countdown !== undefined ? `剩余 ${formatTime(d.countdown)}` : formatTime(d.time);
     this.levelEl.textContent = `Lv.${d.level}`;
     this.killsEl.textContent = String(d.kills);
 
@@ -109,9 +113,27 @@ export class UI {
     return ov;
   }
 
-  showStart(onStart: () => void): void {
+  showStart(onStart: (mode: GameMode, map: MapId | 'random') => void): void {
     this.clearOverlay();
     this.setHudVisible(false);
+    let mode: GameMode = 'endless';
+    let map: MapId | 'random' = 'random';
+    const modeChips = (Object.keys(GAME_MODES) as GameMode[])
+      .map(
+        (id) => `
+        <div class="select-chip ${id === mode ? 'active' : ''}" data-mode="${id}">
+          <b>${GAME_MODES[id].name}</b><span>${GAME_MODES[id].desc}</span>
+        </div>`,
+      )
+      .join('');
+    const mapChips = (Object.keys(MAPS) as MapId[])
+      .map(
+        (id) => `
+        <div class="select-chip select-chip-sm" data-map="${id}" title="${MAPS[id].desc}">
+          <b>${MAPS[id].name}</b>
+        </div>`,
+      )
+      .join('');
     const ov = this.addOverlay(`
       <div class="panel">
         <div class="title">暗夜幸存者</div>
@@ -121,12 +143,39 @@ export class UI {
           <div>武器<b style="color:var(--accent)"> 自动攻击 </b>最近的敌人</div>
           <div><kbd>P</kbd> / <kbd>ESC</kbd> 暂停游戏</div>
         </div>
+        <div class="select-group">
+          <div class="select-label">模式</div>
+          <div class="select-row" id="ui-modes">${modeChips}</div>
+        </div>
+        <div class="select-group">
+          <div class="select-label">地图</div>
+          <div class="select-row" id="ui-maps">${mapChips}
+            <div class="select-chip select-chip-sm active" data-map="random" title="每局从三张地图中随机选择">
+              <b>🎲 随机地图</b>
+            </div>
+          </div>
+        </div>
         <button class="btn" id="ui-start">开始游戏</button>
       </div>
     `);
+    // 选择切换：点击芯片高亮选中态
+    ov.querySelectorAll<HTMLElement>('#ui-modes .select-chip').forEach((el) => {
+      el.addEventListener('click', () => {
+        ov.querySelectorAll('#ui-modes .select-chip').forEach((c) => c.classList.remove('active'));
+        el.classList.add('active');
+        mode = el.dataset.mode as GameMode;
+      });
+    });
+    ov.querySelectorAll<HTMLElement>('#ui-maps .select-chip').forEach((el) => {
+      el.addEventListener('click', () => {
+        ov.querySelectorAll('#ui-maps .select-chip').forEach((c) => c.classList.remove('active'));
+        el.classList.add('active');
+        map = el.dataset.map as MapId | 'random';
+      });
+    });
     ov.querySelector<HTMLButtonElement>('#ui-start')!.addEventListener('click', () => {
       this.clearOverlay();
-      onStart();
+      onStart(mode, map);
     });
   }
 
@@ -187,7 +236,7 @@ export class UI {
     window.addEventListener('keydown', keyHandler);
   }
 
-  showPause(onResume: () => void, onRestart: () => void): void {
+  showPause(onResume: () => void, onRestart: () => void, onMenu: () => void): void {
     this.clearOverlay();
     const ov = this.addOverlay(`
       <div class="panel">
@@ -195,6 +244,7 @@ export class UI {
         <div class="levelup-sub">休息一下。</div>
         <button class="btn" id="ui-resume">继续</button>
         <button class="btn btn-ghost" id="ui-restart">重新开始</button>
+        <button class="btn btn-ghost" id="ui-pause-menu">返回菜单</button>
       </div>
     `);
     ov.querySelector<HTMLButtonElement>('#ui-resume')!.addEventListener('click', () => {
@@ -205,13 +255,17 @@ export class UI {
       this.clearOverlay();
       onRestart();
     });
+    ov.querySelector<HTMLButtonElement>('#ui-pause-menu')!.addEventListener('click', () => {
+      this.clearOverlay();
+      onMenu();
+    });
   }
 
   hidePause(): void {
     this.clearOverlay();
   }
 
-  showGameOver(d: GameOverData, onRestart: () => void): void {
+  showGameOver(d: GameOverData, onRestart: () => void, onMenu: () => void): void {
     this.clearOverlay();
     const title = d.victory ? '🏆 胜利！' : '💀 你倒下了';
     const sub = d.victory ? '你在暗夜中坚持到了最后。' : '暗夜吞没了你，但你战斗得很英勇。';
@@ -225,11 +279,16 @@ export class UI {
           <div class="result-cell"><div class="val">${d.kills}</div><div class="lbl">击杀数</div></div>
         </div>
         <button class="btn" id="ui-again">再来一局</button>
+        <button class="btn btn-ghost" id="ui-menu">返回菜单</button>
       </div>
     `);
     ov.querySelector<HTMLButtonElement>('#ui-again')!.addEventListener('click', () => {
       this.clearOverlay();
       onRestart();
+    });
+    ov.querySelector<HTMLButtonElement>('#ui-menu')!.addEventListener('click', () => {
+      this.clearOverlay();
+      onMenu();
     });
   }
 }

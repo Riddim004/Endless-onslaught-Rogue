@@ -156,7 +156,7 @@ export const WEAPONS = {
     radiusMul: [0, 1, 1.2, 1.2, 1.2, 1.42, 1.42, 1.64, 1.8],
     intervalLow: 0.44,
     intervalHigh: 0.34,
-    intervalHighFrom: 3,
+    intervalHighFrom: 4, // 4 级启用高频灼烧（3 级已涨伤害，错开避免 4 级空升级）
     radiusBase: 62,
   },
   // 冰霜新星：周期性向四周爆发弹幕
@@ -166,7 +166,7 @@ export const WEAPONS = {
     bullets: [0, 8, 8, 10, 14, 14, 16, 20, 24],
     pierceLow: 2,
     pierceHigh: 3,
-    pierceHighFrom: 6,
+    pierceHighFrom: 5, // 5 级启用高穿透（原 6 级与弹幕/伤害叠在同级，导致 5 级空升级）
     speed: 300,
     radius: 7,
     life: 1.0,
@@ -216,5 +216,90 @@ export const WEAPONS = {
     radiusStart: 24,
     expand: 0.4,
     knockback: 300,
+  },
+};
+
+// -----------------------------------------------------------------------------
+// 游戏模式 (Game modes)
+// -----------------------------------------------------------------------------
+export type GameMode = 'endless' | 'timed';
+
+export const GAME_MODES = {
+  endless: { name: '无尽模式', desc: '在无尽敌潮中生存尽可能久' },
+  timed: { name: '限时模式', desc: '存活 10 分钟即获胜', duration: 600 },
+};
+
+// -----------------------------------------------------------------------------
+// 背景地图 (Maps)
+// 调色板与装饰物密度供 background.ts 使用；改这里即可热调背景观感。
+//   base        底色
+//   texture     瓦片噪点/纹理色
+//   grid        瓦片上淡色调网格痕迹的颜色
+//   deco        装饰物颜色数组（各地图装饰绘制时按序取用）
+//   decoChance  每个 256px 格子出现装饰物的概率
+//   decoDouble  已有装饰物的格子再出第 2 个的概率
+//   obstacle    不可通行障碍物参数（obstacles.ts 使用）
+// -----------------------------------------------------------------------------
+export type MapId = 'forest' | 'village' | 'ruins';
+
+// 障碍物公共参数：cell 为生成大格尺寸（每格至多 1 个障碍物，越大越稀疏），
+// safeRadius 为世界原点（玩家出生点）周围不生成障碍物的半径。
+export const OBSTACLES = {
+  cell: 640,
+  safeRadius: 320,
+};
+
+/** 每张地图的障碍物调参 */
+export interface MapObstacleDef {
+  chance: number; // 每个大格生成障碍物的概率
+  scaleMin: number; // 障碍物随机缩放下限
+  scaleMax: number; // 障碍物随机缩放上限
+}
+
+export interface MapDef {
+  name: string;
+  desc: string;
+  base: string;
+  texture: string;
+  grid: string;
+  deco: string[];
+  decoChance: number;
+  decoDouble: number;
+  obstacle: MapObstacleDef;
+}
+
+export const MAPS: Record<MapId, MapDef> = {
+  forest: {
+    name: '幽暗森林',
+    desc: '树影幢幢的深绿密林',
+    base: '#0a140d',
+    texture: '#122417',
+    grid: 'rgba(90, 140, 100, 0.05)',
+    deco: ['#0e1f13', '#13291a', '#183321', '#31402f', '#4a5548'],
+    decoChance: 0.55,
+    decoDouble: 0.25,
+    obstacle: { chance: 0.6, scaleMin: 0.85, scaleMax: 1.25 },
+  },
+  village: {
+    name: '废弃村庄',
+    desc: '荒草掩埋的残破屋舍',
+    base: '#14100c',
+    texture: '#201a12',
+    grid: 'rgba(160, 130, 90, 0.05)',
+    deco: ['#241c12', '#3a2e1c', '#57452a', '#d9a066', '#2b2418'],
+    decoChance: 0.5,
+    decoDouble: 0.22,
+    obstacle: { chance: 0.55, scaleMin: 0.9, scaleMax: 1.2 },
+  },
+  ruins: {
+    name: '赛博废墟',
+    desc: '霓虹残光下的破碎都市',
+    base: '#0d0a1e',
+    texture: '#161130',
+    grid: 'rgba(120, 100, 220, 0.06)',
+    deco: ['#1b1440', '#251a55', '#5ce1ff', '#b56cff', '#241e4a'],
+    decoChance: 0.55,
+    decoDouble: 0.25,
+    obstacle: { chance: 0.58, scaleMin: 0.85, scaleMax: 1.25 },
   },
 };

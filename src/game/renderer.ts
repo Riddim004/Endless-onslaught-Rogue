@@ -1,6 +1,9 @@
 // Canvas renderer. Draws the world relative to a camera centered on the player.
 
 import { Enemy, FloatingText, Gem, Particle, Player, Projectile } from './entities';
+import { MapBackground } from './background';
+import { Obstacle, ObstacleField } from './obstacles';
+import { MapId } from './config';
 
 export interface Beam {
   x1: number;
@@ -29,11 +32,19 @@ export class Renderer {
   width = 0;
   height = 0;
   dpr = 1;
+  /** 地图障碍物（game.ts 用它做碰撞推离，渲染层负责绘制与 setMap 联动） */
+  readonly obstacles = new ObstacleField();
+  private background = new MapBackground();
 
   constructor(private canvas: HTMLCanvasElement) {
     this.ctx = canvas.getContext('2d')!;
     this.resize();
     window.addEventListener('resize', () => this.resize());
+  }
+
+  setMap(map: MapId): void {
+    this.background.setMap(map);
+    this.obstacles.setMap(map);
   }
 
   resize(): void {
@@ -64,46 +75,20 @@ export class Renderer {
     ctx.save();
     ctx.translate(-camX, -camY);
 
-    this.drawBackground(camX, camY, w, h);
+    // 障碍物视口裁剪（已按底边 y 升序），交给实体层做逐实体 Y-sort。
+    const obs = this.obstacles.getVisible(camX, camY, w, h);
+
+    this.background.draw(ctx, camX, camY, w, h, s.time);
     this.drawGems(s.gems, s.time);
     this.drawAuras(s.projectiles, s.time);
     this.drawFields(s.projectiles, s.time);
     this.drawBeams(s.beams);
-    this.drawEnemies(s.enemies);
+    this.drawEntities(s, obs);
     this.drawProjectiles(s.projectiles, s.time);
-    this.drawPlayer(s.player, s.time);
     this.drawParticles(s.particles);
     this.drawTexts(s.texts);
 
     ctx.restore();
-
-    // Vignette
-    const grd = ctx.createRadialGradient(w / 2, h / 2, h * 0.35, w / 2, h / 2, h * 0.85);
-    grd.addColorStop(0, 'rgba(0,0,0,0)');
-    grd.addColorStop(1, 'rgba(0,0,0,0.45)');
-    ctx.fillStyle = grd;
-    ctx.fillRect(0, 0, w, h);
-  }
-
-  private drawBackground(camX: number, camY: number, w: number, h: number): void {
-    const { ctx } = this;
-    const grid = 64;
-    ctx.fillStyle = '#0b0e14';
-    ctx.fillRect(camX, camY, w, h);
-    ctx.strokeStyle = 'rgba(120,140,180,0.06)';
-    ctx.lineWidth = 1;
-    const startX = Math.floor(camX / grid) * grid;
-    const startY = Math.floor(camY / grid) * grid;
-    ctx.beginPath();
-    for (let x = startX; x < camX + w + grid; x += grid) {
-      ctx.moveTo(x, camY);
-      ctx.lineTo(x, camY + h);
-    }
-    for (let y = startY; y < camY + h + grid; y += grid) {
-      ctx.moveTo(camX, y);
-      ctx.lineTo(camX + w, y);
-    }
-    ctx.stroke();
   }
 
   private drawGems(gems: Gem[], time: number): void {
@@ -160,10 +145,16 @@ export class Renderer {
       ctx.globalCompositeOperation = 'lighter';
       ctx.strokeStyle = frost ? 'rgba(160,220,255,0.6)' : 'rgba(255,150,70,0.55)';
       ctx.lineWidth = 3;
-      ctx.setLineDash([14, 12]);
-      ctx.lineDashOffset = frost ? time * 40 : -time * 40;
+      // 虚线按角度等分（而非固定像素长）：段数由基础半径定下且整周闭合，
+      // 段长与旋转偏移都随当前半径同比缩放，圆环呼吸时整体以圆心缩放，
+      // 避免多出的周长全被挤到接缝处、只有一段虚线在变长的怪异观感。
+      const rr = r * 0.94;
+      const segs = Math.max(8, Math.round((Math.PI * 2 * p.radius * 0.94) / 26));
+      const seg = (Math.PI * 2 * rr) / segs;
+      ctx.setLineDash([seg * (14 / 26), seg * (12 / 26)]);
+      ctx.lineDashOffset = (frost ? time : -time) * 0.5 * rr;
       ctx.beginPath();
-      ctx.arc(p.x, p.y, r * 0.94, 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, rr, 0, Math.PI * 2);
       ctx.stroke();
       ctx.setLineDash([]);
       ctx.restore();
@@ -198,6 +189,27 @@ export class Renderer {
           ctx.stroke();
         }
         ctx.setLineDash([]);
+        // 旋臂：两段缓慢旋转的弧，强化旋涡感
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = 'rgba(190,150,255,0.45)';
+        for (let arm = 0; arm < 2; arm++) {
+          const st = time * 2.1 + arm * Math.PI;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, r * 0.34, st, st + 1.9);
+          ctx.stroke();
+        }
+        // 被吸入的光尘：确定性螺旋向内坠落，中途最亮
+        ctx.fillStyle = '#cbb3ff';
+        for (let k = 0; k < 6; k++) {
+          const t = (time * 0.6 + k / 6) % 1;
+          const rad = r * (1.05 - 0.8 * t);
+          const ang = time * 2.6 + k * 2.4 + t * 3.2;
+          ctx.globalAlpha = 1.4 * t * (1 - t);
+          ctx.beginPath();
+          ctx.arc(p.x + Math.cos(ang) * rad, p.y + Math.sin(ang) * rad, 2, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.globalAlpha = 1;
         ctx.restore();
       } else if (p.kind === 'shock') {
         const a = Math.max(0, p.life / p.maxLife);
@@ -216,6 +228,17 @@ export class Renderer {
         ctx.lineWidth = 16 * a + 2;
         ctx.beginPath();
         ctx.arc(p.x, p.y, p.radius * 0.92, 0, Math.PI * 2);
+        ctx.stroke();
+        // 波前碎光：沿扩张环的放射短线，随半径缓慢旋转
+        ctx.globalAlpha = a * 0.6;
+        ctx.strokeStyle = '#dff0ff';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        for (let k = 0; k < 12; k++) {
+          const ang = (k / 12) * Math.PI * 2 + p.radius * 0.015;
+          ctx.moveTo(p.x + Math.cos(ang) * p.radius * 0.82, p.y + Math.sin(ang) * p.radius * 0.82);
+          ctx.lineTo(p.x + Math.cos(ang) * (p.radius + 6), p.y + Math.sin(ang) * (p.radius + 6));
+        }
         ctx.stroke();
         ctx.globalAlpha = 1;
         ctx.restore();
@@ -258,48 +281,103 @@ export class Renderer {
       ctx.strokeStyle = '#ffffff';
       ctx.lineWidth = 2.5;
       trace();
+      // 从主干岐出的分叉小枝（每帧随机，天然闪烁感）
+      ctx.globalAlpha = a * 0.4;
+      ctx.strokeStyle = b.color;
+      ctx.lineWidth = 1.5;
+      for (const i of [2, 4]) {
+        const [bx, by] = pts[i];
+        const ang = Math.random() * Math.PI * 2;
+        const l1 = 10 + Math.random() * 14;
+        const mx = bx + Math.cos(ang) * l1;
+        const my = by + Math.sin(ang) * l1;
+        ctx.beginPath();
+        ctx.moveTo(bx, by);
+        ctx.lineTo(mx, my);
+        ctx.lineTo(mx + Math.cos(ang + 0.6) * l1 * 0.6, my + Math.sin(ang + 0.6) * l1 * 0.6);
+        ctx.stroke();
+      }
+      // 命中点爆闪
+      const fr = 10 + 14 * a;
+      const flash = ctx.createRadialGradient(b.x2, b.y2, 0, b.x2, b.y2, fr);
+      flash.addColorStop(0, '#ffffff');
+      flash.addColorStop(0.4, b.color);
+      flash.addColorStop(1, 'transparent');
+      ctx.globalAlpha = a;
+      ctx.fillStyle = flash;
+      ctx.beginPath();
+      ctx.arc(b.x2, b.y2, fr, 0, Math.PI * 2);
+      ctx.fill();
     }
     ctx.globalAlpha = 1;
     ctx.restore();
   }
 
-  private drawEnemies(enemies: Enemy[]): void {
-    const { ctx } = this;
-    for (const e of enemies) {
-      const flash = e.hitFlash > 0;
-      ctx.save();
-      ctx.translate(e.x, e.y);
-      const squash = 1 + Math.sin(e.wobble) * 0.06;
-      ctx.scale(1, squash);
-
-      // body
-      ctx.beginPath();
-      ctx.arc(0, 0, e.radius, 0, Math.PI * 2);
-      ctx.fillStyle = flash ? '#ffffff' : e.color;
-      ctx.shadowColor = e.color;
-      ctx.shadowBlur = e.kind === 'boss' ? 24 : 8;
-      ctx.fill();
-      ctx.shadowBlur = 0;
-
-      // eyes
-      ctx.fillStyle = 'rgba(0,0,0,0.75)';
-      const eo = e.radius * 0.34;
-      const er = Math.max(1.6, e.radius * 0.14);
-      ctx.beginPath();
-      ctx.arc(-eo, -eo * 0.4, er, 0, Math.PI * 2);
-      ctx.arc(eo, -eo * 0.4, er, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-
-      // hp bar for tougher enemies
-      if (e.hp < e.maxHp && (e.kind === 'tank' || e.kind === 'brute' || e.kind === 'boss')) {
-        const bw = e.radius * 2;
-        const pct = Math.max(0, e.hp / e.maxHp);
-        ctx.fillStyle = 'rgba(0,0,0,0.6)';
-        ctx.fillRect(e.x - bw / 2, e.y - e.radius - 10, bw, 4);
-        ctx.fillStyle = '#ff5d5d';
-        ctx.fillRect(e.x - bw / 2, e.y - e.radius - 10, bw * pct, 4);
+  /**
+   * 实体层：敌人保持原数组顺序绘制（与旧版一致，避免逐帧按 y 重排
+   * 导致密集怪群出现条带/闪烁），仅按障碍物底边分带插入：
+   * y <= 底边的怪物/玩家在该障碍物之前绘制，被屋顶、树冠稳定遮挡；
+   * 屏幕内无障碍物时退化为旧版顺序（所有敌人 → 玩家）。
+   */
+  private drawEntities(s: RenderState, obs: Obstacle[]): void {
+    const n = obs.length;
+    // 所属“带”＝第一个 baseY >= y 的障碍物下标（obs 已升序，二分）
+    const bandOf = (y: number): number => {
+      let lo = 0;
+      let hi = n;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (obs[mid].baseY < y) lo = mid + 1;
+        else hi = mid;
       }
+      return lo;
+    };
+    const bands: Enemy[][] = [];
+    for (let k = 0; k <= n; k++) bands.push([]);
+    for (const e of s.enemies) bands[bandOf(e.y)].push(e);
+    const pBand = bandOf(s.player.y);
+    for (let k = 0; k <= n; k++) {
+      for (const e of bands[k]) this.drawEnemy(e);
+      if (k === pBand) this.drawPlayer(s.player, s.time);
+      if (k < n) this.obstacles.drawRange(this.ctx, obs, k, k + 1, s.time);
+    }
+  }
+
+  private drawEnemy(e: Enemy): void {
+    const { ctx } = this;
+    const flash = e.hitFlash > 0;
+    ctx.save();
+    ctx.translate(e.x, e.y);
+    const squash = 1 + Math.sin(e.wobble) * 0.06;
+    ctx.scale(1, squash);
+
+    // body
+    ctx.beginPath();
+    ctx.arc(0, 0, e.radius, 0, Math.PI * 2);
+    ctx.fillStyle = flash ? '#ffffff' : e.color;
+    ctx.shadowColor = e.color;
+    ctx.shadowBlur = e.kind === 'boss' ? 24 : 8;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // eyes
+    ctx.fillStyle = 'rgba(0,0,0,0.75)';
+    const eo = e.radius * 0.34;
+    const er = Math.max(1.6, e.radius * 0.14);
+    ctx.beginPath();
+    ctx.arc(-eo, -eo * 0.4, er, 0, Math.PI * 2);
+    ctx.arc(eo, -eo * 0.4, er, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    // hp bar for tougher enemies
+    if (e.hp < e.maxHp && (e.kind === 'tank' || e.kind === 'brute' || e.kind === 'boss')) {
+      const bw = e.radius * 2;
+      const pct = Math.max(0, e.hp / e.maxHp);
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(e.x - bw / 2, e.y - e.radius - 10, bw, 4);
+      ctx.fillStyle = '#ff5d5d';
+      ctx.fillRect(e.x - bw / 2, e.y - e.radius - 10, bw * pct, 4);
     }
   }
 
@@ -353,6 +431,35 @@ export class Renderer {
         ctx.moveTo(p.x, p.y);
         ctx.lineTo(p.x + tx * len, p.y + ty * len);
         ctx.stroke();
+        // 彗尾内芯：更短更细的白热流光
+        const core = ctx.createLinearGradient(p.x, p.y, p.x + tx * len * 0.55, p.y + ty * len * 0.55);
+        core.addColorStop(0, 'rgba(255,255,255,0.85)');
+        core.addColorStop(1, 'transparent');
+        ctx.strokeStyle = core;
+        ctx.lineWidth = p.radius * 0.7;
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(p.x + tx * len * 0.55, p.y + ty * len * 0.55);
+        ctx.stroke();
+      }
+
+      // 守护法球：沿圆轨迹拖出三段渐隐彗尾（画在球体下方）
+      if (p.kind === 'orbit' && p.orbit) {
+        const ocx = p.x - Math.cos(p.orbit.angle) * p.orbit.radius;
+        const ocy = p.y - Math.sin(p.orbit.angle) * p.orbit.radius;
+        const dir = p.orbit.speed >= 0 ? 1 : -1;
+        ctx.lineCap = 'round';
+        for (let seg = 0; seg < 3; seg++) {
+          const a0 = p.orbit.angle - dir * 0.17 * (seg + 1);
+          const a1 = p.orbit.angle - dir * 0.17 * seg;
+          ctx.strokeStyle = p.color;
+          ctx.globalAlpha = 0.32 - seg * 0.1;
+          ctx.lineWidth = p.radius * (1.1 - seg * 0.28);
+          ctx.beginPath();
+          ctx.arc(ocx, ocy, p.orbit.radius, Math.min(a0, a1), Math.max(a0, a1));
+          ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
       }
 
       // Glowing orb: white-hot core fading into the projectile color.
@@ -365,6 +472,22 @@ export class Renderer {
       ctx.beginPath();
       ctx.arc(p.x, p.y, outer, 0, Math.PI * 2);
       ctx.fill();
+
+      if (p.kind === 'nova') {
+        // 六芒冰晶：随时间自旋的三根交叉短线
+        const ia = time * 4 + p.id * 1.3;
+        ctx.strokeStyle = 'rgba(220,245,255,0.8)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        for (let k = 0; k < 3; k++) {
+          const a2 = ia + (k * Math.PI) / 3;
+          const dx = Math.cos(a2) * p.radius * 1.9;
+          const dy = Math.sin(a2) * p.radius * 1.9;
+          ctx.moveTo(p.x - dx, p.y - dy);
+          ctx.lineTo(p.x + dx, p.y + dy);
+        }
+        ctx.stroke();
+      }
 
       if (p.kind === 'orbit') {
         // sparkle ring accent

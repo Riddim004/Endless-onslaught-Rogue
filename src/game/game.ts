@@ -15,7 +15,7 @@ import { Input } from './input';
 import { Renderer, Beam } from './renderer';
 import { Spawner } from './spawner';
 import { UI } from './ui';
-import { angleTo, clamp, rand } from './math';
+import { angleTo, clamp, pick, rand } from './math';
 import {
   Choice,
   WeaponContext,
@@ -24,7 +24,7 @@ import {
   getWeaponDef,
   recomputeStats,
 } from './skills';
-import { PLAYER, XP_CURVE, DIFFICULTY } from './config';
+import { PLAYER, XP_CURVE, DIFFICULTY, GAME_MODES, GameMode, MapId } from './config';
 
 type State = 'menu' | 'playing' | 'levelup' | 'paused' | 'gameover';
 
@@ -46,6 +46,8 @@ export class Game implements WeaponContext {
   weapons: WeaponInstance[] = [];
 
   private state: State = 'menu';
+  private gameMode: GameMode = 'endless';
+  private mapId: MapId = 'forest';
   private kills = 0;
   private shake = 0;
   private pendingLevelUps = 0;
@@ -57,7 +59,7 @@ export class Game implements WeaponContext {
     this.input = new Input();
     this.ui = new UI(uiRoot);
     this.reset();
-    this.ui.showStart(() => this.start());
+    this.showMenu();
     requestAnimationFrame((t) => this.loop(t));
   }
 
@@ -83,13 +85,31 @@ export class Game implements WeaponContext {
     this.addWeapon('bolt');
   }
 
-  private start(): void {
+  /** 回到开始菜单（首次进入 / 结算后返回菜单共用） */
+  private showMenu(): void {
+    this.state = 'menu';
+    this.ui.setHudVisible(false);
+    this.ui.showStart((mode, map) => this.start(mode, this.resolveMap(map)));
+  }
+
+  /** 'random' 时从三张地图中随机取一（每局重随） */
+  private resolveMap(map: MapId | 'random'): MapId {
+    if (map === 'random') return pick<MapId>(['forest', 'village', 'ruins']);
+    return map;
+  }
+
+  private start(mode: GameMode, map: MapId): void {
+    this.gameMode = mode;
+    this.mapId = map;
+    this.renderer.setMap(map);
     this.reset();
     this.state = 'playing';
     this.ui.setHudVisible(true);
   }
 
   private restart(): void {
+    // 再来一局：沿用当前 gameMode / mapId
+    this.renderer.setMap(this.mapId);
     this.reset();
     this.state = 'playing';
     this.ui.setHudVisible(true);
@@ -131,6 +151,9 @@ export class Game implements WeaponContext {
         time: this.spawner.time,
         kills: this.kills,
         tray: this.weapons.map((w) => ({ icon: getWeaponDef(w.defId).icon, level: w.level })),
+        ...(this.gameMode === 'timed'
+          ? { countdown: GAME_MODES.timed.duration - this.spawner.time }
+          : {}),
       });
     }
 
@@ -147,6 +170,7 @@ export class Game implements WeaponContext {
             this.state = 'playing';
           },
           () => this.restart(),
+          () => this.showMenu(),
         );
       } else if (this.state === 'paused') {
         this.state = 'playing';
@@ -188,6 +212,7 @@ export class Game implements WeaponContext {
     for (const e of spawn.enemies) this.enemies.push(e);
 
     this.updateEnemies(dt);
+    this.collideObstacles();
     this.updateProjectiles(dt);
     this.updateGems(dt);
     this.updateParticles(dt);
@@ -205,6 +230,12 @@ export class Game implements WeaponContext {
     // Lose (no time limit — survive as long as you can)
     if (p.hp <= 0) {
       this.gameOver(false);
+      return;
+    }
+
+    // 限时模式：存活满时长即获胜
+    if (this.gameMode === 'timed' && this.spawner.time >= GAME_MODES.timed.duration) {
+      this.gameOver(true);
       return;
     }
 
@@ -289,6 +320,20 @@ export class Game implements WeaponContext {
           }
         }
       }
+    }
+  }
+
+  /**
+   * 玩家与所有敌人（含踩踏事件 sweep 敌人与 Boss）对地图障碍物做圆形推离；
+   * 投射物 / 经验宝石 / 粒子不受阻挡（保持武器手感）。
+   * 在玩家移动与 separateEnemies 之后调用；每个实体只查询自身附近格子的碰撞体。
+   * 刷新在障碍物内的敌人也靠每帧推离自然挤出（1~2 帧内完成，不可感知）。
+   */
+  private collideObstacles(): void {
+    const field = this.renderer.obstacles;
+    field.collide(this.player, this.player.radius);
+    for (const e of this.enemies) {
+      field.collide(e, e.radius);
     }
   }
 
@@ -609,6 +654,7 @@ export class Game implements WeaponContext {
     this.ui.showGameOver(
       { time: this.spawner.time, level: this.player.level, kills: this.kills, victory },
       () => this.restart(),
+      () => this.showMenu(),
     );
   }
 
