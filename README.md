@@ -10,7 +10,7 @@
 
 A fast-paced 2D roguelite survivor game (vampire-survivors-like), built from scratch with **TypeScript + HTML5 Canvas + Vite** — no game engine, no frameworks.
 
-Survive an endless, ever-growing monster onslaught. Level up, pick from 9 weapons and 10 passives, and see how long you can last.
+Pick a class, survive an endless, ever-growing monster onslaught. Level up, build from 12 weapons and 10 passives, evolve your ultimate super-weapon, and see how long you can last.
 
 ## 🎮 Download & Play
 
@@ -18,22 +18,26 @@ Grab the Windows portable exe from [**Releases**](https://github.com/Riddim004/E
 
 ## ✨ Features
 
-- **9 weapons**: homing bolts, roaming daggers, orbiting orbs, flame aura, frost nova, chain lightning, frost field, gravity singularity, shockwave
-- **10 passives**: damage, attack speed, area, move speed and more — several with **no level cap**
-- **Endless difficulty**: enemy HP (up to 30×), speed (3×) and spawn rate (10×) ramp up over 10 minutes, then it's pure survival
-- **Stampede events**: clusters of 50–100 monsters periodically sweep across the screen
-- **Minute bosses**: a boss spawns every minute with growing HP
-- **Full-screen pickup**, crit builds up to 100%, one free re-roll per level-up
+- **2 classes**: Mage (homing bolts, faster casting & bigger area) and Swordsman (melee sword sweep, tankier & faster) — each with a unique starting weapon and signature look
+- **12 weapons**: homing bolts, roaming daggers, orbiting orbs, flame aura, frost nova, chain lightning, frost field, gravity singularity, shockwave, blade-of-dawn sweep, plus two **active weapons**
+- **Active weapons** (aim with the mouse, one per run): **Laser Cannon** (click to fire a piercing beam) and **Annihilation Channel** (hold to burn an area, energy-gauge driven)
+- **Super weapon evolutions**: max a weapon to roll a golden evolution card — e.g. the laser splits into a 3-beam prism volley
+- **10 passives**: damage, attack speed, area, move speed and more — several with **no level cap**; armor uses percentage-based mitigation
+- **Destructible props** scattered around the map — smash them for a chance at gems, health, or a chain explosion
+- **Procedural audio**: real-time synthesized BGM and boss cues (no audio files)
+- **Two-stage difficulty**: enemy stats ramp up over the first 7 minutes, then grow exponentially — endless runs stay dangerous
+- **Stampede events**, **timed bosses**, full-screen pickup, crit builds up to 100%, one free re-roll per level-up
 
 ## 🕹️ Controls
 
 | Key | Action |
 |---|---|
 | `WASD` / Arrow keys | Move |
+| Mouse | Aim & fire **active weapons** (left click / hold) |
 | `P` / `Esc` | Pause |
-| Mouse | Pick level-up choices |
+| `M` | Mute / unmute |
 
-Weapons fire automatically — your job is to dodge, position, and build.
+Auto weapons fire on their own — your job is to dodge, position, aim your active weapon, and build.
 
 ## 🛠️ Development
 
@@ -59,12 +63,14 @@ src/
 └── game/
     ├── config.ts       # ★ all gameplay tuning in one place
     ├── game.ts         # main loop, collisions, XP & level-up flow
-    ├── skills.ts       # weapon & passive definitions
+    ├── skills.ts       # weapon & passive definitions, super evolutions
     ├── spawner.ts      # enemy waves, difficulty ramp, bosses, stampedes
     ├── entities.ts     # player / enemy / projectile factories
+    ├── destructibles.ts # destructible props field
     ├── renderer.ts     # canvas rendering & visual effects
-    ├── input.ts        # keyboard input
-    ├── ui.ts           # HUD & level-up screens
+    ├── audio.ts        # procedural BGM & SFX (Web Audio)
+    ├── input.ts        # keyboard & mouse input
+    ├── ui.ts           # HUD, menu & level-up screens
     └── math.ts         # small math helpers
 ```
 
@@ -76,7 +82,7 @@ src/
 
 一款快节奏的 2D 肉鸽幸存者游戏（类吸血鬼幸存者），使用 **TypeScript + HTML5 Canvas + Vite** 从零编写——没有游戏引擎，没有框架。
 
-在无穷无尽、不断变强的怪物狂潮中求生。升级、从 9 种武器和 10 种被动中构筑你的 Build，看看你能活多久。
+选一个职业，在无穷无尽、不断变强的怪物狂潮中求生。升级、从 12 种武器和 10 种被动中构筑你的 Build、将武器进化为终极超武，看看你能活多久。
 
 ## 🎮 下载游玩
 
@@ -84,22 +90,26 @@ src/
 
 ## ✨ 特性
 
-- **9 种武器**：追踪飞弹、乱飞回旋刀、守护法球、烈焰领域、冰霜新星、连锁闪电、霜寒领域、重力奇点、震荡波
-- **10 种被动**：伤害、攻速、范围、移速等——其中多项**没有等级上限**
-- **无尽难度**：怪物血量（最高 30 倍）、移速（3 倍）、出怪速度（10 倍）在 10 分钟内持续攀升，之后就是纯粹的生存考验
-- **踩踏事件**：每隔一段时间，50–100 只怪物组成的兽群横扫屏幕
-- **每分钟 Boss**：每分钟刷新一个血量递增的 Boss
-- **全屏拾取**、暴击可堆到 100%、每次升级有一次免费刷新选项
+- **2 个职业**：法师（追踪飞弹，施法更快、范围更大）与剑客（近战扇形挥砍，血厚移速快）——各自拥有专属初始武器与标志性装扮
+- **12 种武器**：追踪飞弹、乱飞回旋刀、守护法球、烈焰领域、冰霜新星、连锁闪电、霜寒领域、重力奇点、震荡波、破晓之刃，以及两种**主动武器**
+- **主动武器**（鼠标瞄准，每局限一把）：**激光炮**（点击发射贯穿光束）与**湮灭引导**（按住持续灼烧区域，充能槽驱动）
+- **超武进化**：武器满级后升级会刷出金色进化卡——例如激光炮分裂为三束棱镜齐射
+- **10 种被动**：伤害、攻速、范围、移速等——其中多项**没有等级上限**；护甲为百分比减伤
+- **可破坏道具**：场景中散布可打碎的道具，有概率掉落经验宝石、补血或触发连锁爆炸
+- **程序化音频**：实时合成的 BGM 与 Boss 提示音（零音频素材文件）
+- **两段式难度**：怪物属性在前 7 分钟线性攻升，之后转为指数增长——无尽局始终充满威胁
+- **踩踏事件**、**限时 Boss**、全屏拾取、暴击可堆到 100%、每次升级一次免费刷新选项
 
 ## 🕹️ 操作
 
 | 按键 | 功能 |
 |---|---|
 | `WASD` / 方向键 | 移动 |
+| 鼠标 | 瞄准并施放**主动武器**（左键点击 / 按住）|
 | `P` / `Esc` | 暂停 |
-| 鼠标 | 选择升级选项 |
+| `M` | 静音 / 取消静音 |
 
-武器全自动攻击——你要做的是走位、拉扯和构筑。
+自动武器会自行攻击——你要做的是走位、拉扯、瞄准主动武器和构筑。
 
 ## 🛠️ 开发
 
@@ -125,11 +135,13 @@ src/
 └── game/
     ├── config.ts       # ★ 所有可调数值集中于此
     ├── game.ts         # 主循环、碰撞、经验与升级流程
-    ├── skills.ts       # 武器与被动定义
+    ├── skills.ts       # 武器与被动定义、超武进化
     ├── spawner.ts      # 出怪波次、难度爬升、Boss、踩踏事件
     ├── entities.ts     # 玩家/怪物/投射物工厂
+    ├── destructibles.ts # 可破坏道具管理
     ├── renderer.ts     # Canvas 渲染与特效
-    ├── input.ts        # 键盘输入
-    ├── ui.ts           # HUD 与升级界面
+    ├── audio.ts        # 程序化 BGM 与音效（Web Audio）
+    ├── input.ts        # 键盘与鼠标输入
+    ├── ui.ts           # HUD、菜单与升级界面
     └── math.ts         # 数学工具函数
 ```
