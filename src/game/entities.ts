@@ -1,6 +1,6 @@
 // Entity data structures and factories.
 
-import { PLAYER, ENEMIES, PASSIVES } from './config';
+import { PLAYER, ENEMIES, PASSIVES, DESTRUCTIBLES, CharacterId } from './config';
 
 
 export interface PlayerStats {
@@ -13,7 +13,7 @@ export interface PlayerStats {
   pickupRadius: number;
   xpMult: number;
   regen: number; // hp per second
-  armor: number; // flat damage reduction per hit
+  armor: number; // damage reduction stat used in percentage-based formula
   amount: number; // extra projectiles for supporting weapons
   critChance: number; // 0..1
   critMult: number;
@@ -50,9 +50,12 @@ export interface Player {
   invuln: number; // seconds of i-frames remaining
   hurtFlash: number;
   passives: Map<string, number>; // passive id -> level
+  charId: CharacterId; // 所选角色（决定初始武器/装扮/基础属性修正）
+  attackAnim: number; // 攻击动作计时（剑客挥剑时刷新，供渲染控制剑光动画）
+  attackDir: 1 | -1; // 本次挥砍扫动方向（与剑光同步）
 }
 
-export function createPlayer(x: number, y: number): Player {
+export function createPlayer(x: number, y: number, charId: CharacterId = 'mage'): Player {
   const stats = baseStats();
   return {
     x,
@@ -67,6 +70,9 @@ export function createPlayer(x: number, y: number): Player {
     invuln: 0,
     hurtFlash: 0,
     passives: new Map(),
+    charId,
+    attackAnim: 0,
+    attackDir: 1,
   };
 }
 
@@ -110,7 +116,7 @@ const ENEMY_TEMPLATES: Record<EnemyKind, EnemyTemplate> = ENEMIES;
 
 let enemyIdCounter = 1;
 
-export function createEnemy(kind: EnemyKind, x: number, y: number, hpScale: number, speedScale = 1): Enemy {
+export function createEnemy(kind: EnemyKind, x: number, y: number, hpScale: number, speedScale = 1, dmgScale = 1): Enemy {
   const t = ENEMY_TEMPLATES[kind];
   const hp = Math.round(t.hp * hpScale);
   return {
@@ -122,7 +128,7 @@ export function createEnemy(kind: EnemyKind, x: number, y: number, hpScale: numb
     hp,
     maxHp: hp,
     speed: t.speed * speedScale,
-    damage: t.damage,
+    damage: Math.round(t.damage * dmgScale),
     xpValue: t.xpValue,
     color: t.color,
     kx: 0,
@@ -216,6 +222,8 @@ export interface Gem {
   vy: number;
   pulled: boolean;
   color: string;
+  /** 若设置，拾取时恢复生命而非加经验（可破坏道具掉落的血包） */
+  heal?: number;
 }
 
 export function createGem(x: number, y: number, value: number): Gem {
@@ -223,6 +231,11 @@ export function createGem(x: number, y: number, value: number): Gem {
   if (value >= 20) color = '#ffd166';
   else if (value >= 5) color = '#6bd0ff';
   return { x, y, value, vx: 0, vy: 0, pulled: false, color };
+}
+
+/** 血包：同样可被磁力吸取，拾取时回血而非加经验 */
+export function createHeal(x: number, y: number, amount: number): Gem {
+  return { x, y, value: 0, vx: 0, vy: 0, pulled: false, color: '#ff6b8b', heal: amount };
 }
 
 export interface Particle {
@@ -244,4 +257,56 @@ export interface FloatingText {
   text: string;
   color: string;
   size: number;
+  crit?: boolean; // 暴击伤害：渲染时额外描边 + 轻微上弹弹跳
+}
+
+// -----------------------------------------------------------------------------
+// 可破坏道具 (Destructible)
+// 游戏拥有的可打碎物件：有 HP，仅阻挡玩家，被投射物打碎后按小概率掉落。
+// x 为锚点水平中心，y 为底边（=baseY，供 Y-sort）；碰撞/受击圆心为 (cx,cy) 半径 r。
+// -----------------------------------------------------------------------------
+export interface Destructible {
+  id: number;
+  cellKey: string; // 所属生成格子（去重 / 摧毁记录用）
+  type: number; // 地图内造型变体 0/1
+  x: number; // 锚点中心 X（绘制原点）
+  y: number; // 锚点底边 Y
+  baseY: number; // = y，Y-sort 依据
+  scale: number;
+  seed: number; // 确定性绘制细节种子
+  r: number; // 碰撞 / 受击半径
+  cx: number; // 碰撞/受击圆心 X
+  cy: number; // 碰撞/受击圆心 Y
+  hp: number;
+  maxHp: number;
+  hitFlash: number;
+}
+
+let destructibleIdCounter = 1;
+
+export function createDestructible(
+  cellKey: string,
+  type: number,
+  x: number,
+  y: number,
+  scale: number,
+  seed: number,
+): Destructible {
+  const r = DESTRUCTIBLES.radius * scale;
+  return {
+    id: destructibleIdCounter++,
+    cellKey,
+    type,
+    x,
+    y,
+    baseY: y,
+    scale,
+    seed,
+    r,
+    cx: x,
+    cy: y - r * 0.7,
+    hp: DESTRUCTIBLES.hp,
+    maxHp: DESTRUCTIBLES.hp,
+    hitFlash: 0,
+  };
 }

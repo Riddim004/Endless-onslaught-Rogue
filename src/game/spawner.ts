@@ -27,14 +27,26 @@ export class Spawner {
     return Math.min(1, this.time / DIFFICULTY.rampSeconds);
   }
 
-  /** Enemy HP scales gradually up to hpMaxScale. */
+  /** 满 ramp 之后的类指数后期增长：每分钟复利 ×rate（之前恒为 1） */
+  private lateMul(rate: number): number {
+    const over = this.time - DIFFICULTY.rampSeconds;
+    if (over <= 0) return 1;
+    return Math.pow(rate, over / 60);
+  }
+
+  /** Enemy HP: linear ramp up to hpMaxScale, then compounding late growth. */
   private hpScale(): number {
-    return 1 + (DIFFICULTY.hpMaxScale - 1) * this.ramp();
+    return (1 + (DIFFICULTY.hpMaxScale - 1) * this.ramp()) * this.lateMul(DIFFICULTY.lateGrowth.hpPerMinute);
   }
 
   /** Enemy move speed scales gradually up to speedMaxScale. */
   private speedScale(): number {
     return 1 + (DIFFICULTY.speedMaxScale - 1) * this.ramp();
+  }
+
+  /** Enemy damage: linear ramp up to dmgMaxScale, then mild compounding late growth. */
+  private dmgScale(): number {
+    return (1 + (DIFFICULTY.dmgMaxScale - 1) * this.ramp()) * this.lateMul(DIFFICULTY.lateGrowth.dmgPerMinute);
   }
 
   /** Seconds between spawn ticks; spawn rate ramps up to spawnRateMax over time. */
@@ -80,7 +92,9 @@ export class Spawner {
     if (minute >= 1 && !this.bossTimers.has(minute)) {
       this.bossTimers.add(minute);
       const { x, y } = this.spawnPoint(playerX, playerY, viewW, viewH);
-      const boss = createEnemy('boss', x, y, 1 + (minute - 1) * DIFFICULTY.bossHpStepPerMinute);
+      // Boss 血量：逐只线性递增，后期另吃类指数增长（与小怪同步膨胀，避免相对变脆）
+      const bossHp = (1 + (minute - 1) * DIFFICULTY.bossHpStepPerMinute) * this.lateMul(DIFFICULTY.lateGrowth.hpPerMinute);
+      const boss = createEnemy('boss', x, y, bossHp, 1, this.dmgScale());
       result.enemies.push(boss);
       result.bossSpawned = true;
     }
@@ -90,9 +104,10 @@ export class Spawner {
       const n = this.batchSize();
       const hp = this.hpScale();
       const spd = this.speedScale();
+      const dmg = this.dmgScale();
       for (let i = 0; i < n; i++) {
         const { x, y } = this.spawnPoint(playerX, playerY, viewW, viewH);
-        result.enemies.push(createEnemy(this.weightedKind(), x, y, hp, spd));
+        result.enemies.push(createEnemy(this.weightedKind(), x, y, hp, spd, dmg));
       }
     }
 
@@ -138,11 +153,12 @@ export class Spawner {
     const sweepTime = crossDist / speed;
     const hp = this.hpScale();
     const spd = this.speedScale();
+    const dmg = this.dmgScale();
     for (let i = 0; i < count; i++) {
       const sx = baseX + rand(-170, 170);
       const sy = baseY + rand(-170, 170);
       const kind: EnemyKind = Math.random() < 0.7 ? 'walker' : 'fast';
-      const e = createEnemy(kind, sx, sy, hp, spd);
+      const e = createEnemy(kind, sx, sy, hp, spd, dmg);
       e.sweepVx = dirX * speed;
       e.sweepVy = dirY * speed;
       e.sweepTimer = sweepTime;

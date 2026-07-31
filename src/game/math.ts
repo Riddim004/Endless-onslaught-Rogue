@@ -56,3 +56,27 @@ export function formatTime(totalSeconds: number): string {
   const rem = s % 60;
   return `${m}:${rem.toString().padStart(2, '0')}`;
 }
+
+/**
+ * Andrew 单调链凸包：返回逆时针顺序的凸包顶点。
+ * 点数 < 3 时直接返回副本（调用方自行退化处理）。
+ */
+export function convexHull(pts: Vec2[]): Vec2[] {
+  if (pts.length < 3) return pts.slice();
+  const sorted = pts.slice().sort((a, b) => a.x - b.x || a.y - b.y);
+  const cross = (o: Vec2, a: Vec2, b: Vec2) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+  const lower: Vec2[] = [];
+  for (const p of sorted) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+    lower.push(p);
+  }
+  const upper: Vec2[] = [];
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    const p = sorted[i];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+    upper.push(p);
+  }
+  lower.pop();
+  upper.pop();
+  return lower.concat(upper);
+}

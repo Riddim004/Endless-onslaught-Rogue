@@ -1,9 +1,10 @@
 // Canvas renderer. Draws the world relative to a camera centered on the player.
 
-import { Enemy, FloatingText, Gem, Particle, Player, Projectile } from './entities';
+import { Enemy, FloatingText, Gem, Particle, Player, Projectile, Destructible } from './entities';
 import { MapBackground } from './background';
 import { Obstacle, ObstacleField } from './obstacles';
-import { MapId } from './config';
+import { MapId, DESTRUCTIBLES } from './config';
+import { convexHull } from './math';
 
 export interface Beam {
   x1: number;
@@ -13,16 +14,79 @@ export interface Beam {
   color: string;
   life: number;
   maxLife: number;
+  /** 有值时按直线光束渲染（激光），否则为锯齿闪电风格 */
+  width?: number;
+}
+
+/** 主动武器准星状态（世界坐标） */
+export interface AimState {
+  x: number;
+  y: number;
+  ready: boolean;
+  charge: number; // 0..1 充能进度
+  color: string;
+}
+
+/** 持续引导灼烧区（世界坐标）；targets 为超武选定目标位置（画凸包能量罩） */
+export interface ChannelFx {
+  x: number;
+  y: number;
+  radius: number;
+  targets: { x: number; y: number }[] | null;
+}
+
+/** 近战剑光：以 (x,y) 为支点的一道新月形刃光，随生命周期扫过弧面并向外推 */
+export interface Slash {
+  x: number;
+  y: number;
+  angle: number; // 中心方向
+  reach: number; // 剑光半径
+  arcHalf: number; // 半张角
+  dir: 1 | -1; // 扫动方向（逆/顺时针，逐次交替更有挥砍感）
+  life: number;
+  maxLife: number;
+  color: string;
+  // 以下为游戏逻辑字段（renderer 不读）：伤害随刃光扫到才结算，保证所见即所得
+  dmg?: number;
+  knockback?: number;
+  hit?: Set<number>; // 已命中集合（敌人 id / 道具 id+偏移）
+}
+
+/**
+ * 某一时刻剑光的几何状态（渲染与伤害判定共用同一公式，确保视觉覆盖区 = 命中区）：
+ * - 前 55% 生命刃口从起刃侧 ease-out 扫向另一侧；
+ * - 半径随进度外推 18%（剑气飞出）。
+ */
+export function slashGeometry(sl: Slash): {
+  fade: number;
+  sweep: number;
+  reach: number;
+  a0: number;
+  span: number;
+  lead: number;
+} {
+  const t = 1 - sl.life / sl.maxLife;
+  const fade = Math.max(0, sl.life / sl.maxLife);
+  const sweep = Math.min(1, t / 0.55);
+  const eased = 1 - (1 - sweep) ** 3;
+  const reach = sl.reach * (1 + 0.18 * t);
+  const a0 = sl.angle - sl.arcHalf * sl.dir;
+  const span = sl.arcHalf * 2 * sl.dir * eased;
+  return { fade, sweep, reach, a0, span, lead: a0 + span };
 }
 
 export interface RenderState {
   player: Player;
   enemies: Enemy[];
+  destructibles: Destructible[];
   projectiles: Projectile[];
   gems: Gem[];
   particles: Particle[];
   texts: FloatingText[];
   beams: Beam[];
+  slashes: Slash[];
+  aim: AimState | null;
+  channel: ChannelFx | null;
   time: number;
   shake: number;
 }
@@ -35,6 +99,9 @@ export class Renderer {
   /** 地图障碍物（game.ts 用它做碰撞推离，渲染层负责绘制与 setMap 联动） */
   readonly obstacles = new ObstacleField();
   private background = new MapBackground();
+  private mapId: MapId = 'forest';
+  /** 画布系统光标是否已隐藏（游戏内准星显示时隐藏，避免双光标） */
+  private cursorHidden = false;
 
   constructor(private canvas: HTMLCanvasElement) {
     this.ctx = canvas.getContext('2d')!;
@@ -43,6 +110,7 @@ export class Renderer {
   }
 
   setMap(map: MapId): void {
+    this.mapId = map;
     this.background.setMap(map);
     this.obstacles.setMap(map);
   }
@@ -61,6 +129,12 @@ export class Renderer {
     const { ctx } = this;
     const w = this.width;
     const h = this.height;
+    // 有游戏内准星时隐藏系统光标，避免两个光标叠在一起
+    const hideCursor = !!s.aim;
+    if (hideCursor !== this.cursorHidden) {
+      this.cursorHidden = hideCursor;
+      this.canvas.style.cursor = hideCursor ? 'none' : '';
+    }
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
 
@@ -85,8 +159,11 @@ export class Renderer {
     this.drawBeams(s.beams);
     this.drawEntities(s, obs);
     this.drawProjectiles(s.projectiles, s.time);
+    this.drawSlashes(s.slashes);
+    if (s.channel) this.drawChannel(s.player, s.channel, s.time);
     this.drawParticles(s.particles);
     this.drawTexts(s.texts);
+    if (s.aim) this.drawAim(s.aim, s.time);
 
     ctx.restore();
   }
@@ -115,6 +192,12 @@ export class Renderer {
       ctx.fillStyle = g.color;
       ctx.fillRect(-r * 0.6, -r * 0.6, r * 1.2, r * 1.2);
       ctx.restore();
+      // 血包：额外叠一个白色十字，一眼读出“回血”
+      if (g.heal) {
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(g.x - 4, g.y - 1.3, 8, 2.6);
+        ctx.fillRect(g.x - 1.3, g.y - 4, 2.6, 8);
+      }
     }
     ctx.restore();
   }
@@ -246,6 +329,178 @@ export class Renderer {
     }
   }
 
+  /**
+   * 主动武器准星（世界坐标）：
+   * 就绪——青色双弧圈 + 中心点，微呼吸；充能中——灰圈 + 按进度补全的充能弧。
+   */
+  private drawAim(aim: AimState, time: number): void {
+    const { ctx } = this;
+    ctx.save();
+    ctx.translate(aim.x, aim.y);
+    ctx.lineCap = 'round';
+    if (aim.ready) {
+      const pulse = 1 + Math.sin(time * 6) * 0.08;
+      const r = 11 * pulse;
+      ctx.strokeStyle = aim.color;
+      ctx.globalAlpha = 0.9;
+      ctx.lineWidth = 2;
+      // 双弧圈（缺口对称）
+      ctx.beginPath();
+      ctx.arc(0, 0, r, -0.4 * Math.PI, 0.4 * Math.PI);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(0, 0, r, 0.6 * Math.PI, 1.4 * Math.PI);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = aim.color;
+      ctx.beginPath();
+      ctx.arc(0, 0, 2.2, 0, Math.PI * 2);
+      ctx.fill();
+      // 就绪但能量/充能未满（如引导中消耗）：外圈细弧实时显示余量
+      if (aim.charge < 0.995) {
+        ctx.globalAlpha = 0.75;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(0, 0, r + 4.5, -Math.PI / 2, -Math.PI / 2 + aim.charge * Math.PI * 2);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+    } else {
+      ctx.strokeStyle = 'rgba(150,160,175,0.35)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(0, 0, 11, 0, Math.PI * 2);
+      ctx.stroke();
+      // 充能进度弧（从顶部顺时针）
+      ctx.strokeStyle = aim.color;
+      ctx.globalAlpha = 0.65;
+      ctx.beginPath();
+      ctx.arc(0, 0, 11, -Math.PI / 2, -Math.PI / 2 + aim.charge * Math.PI * 2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+  }
+
+  /**
+   * 持续引导（湮灭引导）：赤色能量从主角飞向光标圆心 + 光标处脉动灼烧圆。
+   * 均为加色叠加（lighter），多股能量流带拖影 + 内核白热。
+   */
+  private drawChannel(player: Player, ch: ChannelFx, time: number): void {
+    const { ctx } = this;
+    const ang = Math.atan2(ch.y - player.y, ch.x - player.x);
+    const sx = player.x + Math.cos(ang) * player.radius;
+    const sy = player.y + Math.sin(ang) * player.radius;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+    // 能量流带：两股正弦扰动的赤红束 + 白热芯
+    const nx = -Math.sin(ang);
+    const ny = Math.cos(ang);
+    const segs = 10;
+    for (let strand = 0; strand < 2; strand++) {
+      const amp = 6 + strand * 4;
+      const phase = time * 22 + strand * Math.PI;
+      ctx.beginPath();
+      for (let i = 0; i <= segs; i++) {
+        const t = i / segs;
+        const wob = Math.sin(t * Math.PI * 2 + phase) * amp * Math.sin(t * Math.PI);
+        const px = sx + (ch.x - sx) * t + nx * wob;
+        const py = sy + (ch.y - sy) * t + ny * wob;
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.strokeStyle = strand === 0 ? 'rgba(255,60,60,0.55)' : 'rgba(255,120,80,0.4)';
+      ctx.lineWidth = strand === 0 ? 5 : 3;
+      ctx.stroke();
+    }
+    // 主干白热芯
+    ctx.strokeStyle = 'rgba(255,220,210,0.9)';
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(ch.x, ch.y);
+    ctx.stroke();
+    // 光标灼烧圆：径向渐变填充 + 脉动外环
+    const pulse = 1 + Math.sin(time * 10) * 0.06;
+    const r = ch.radius * pulse;
+    const grd = ctx.createRadialGradient(ch.x, ch.y, r * 0.2, ch.x, ch.y, r);
+    grd.addColorStop(0, 'rgba(255,80,60,0.45)');
+    grd.addColorStop(0.7, 'rgba(200,30,30,0.22)');
+    grd.addColorStop(1, 'rgba(120,10,10,0)');
+    ctx.fillStyle = grd;
+    ctx.beginPath();
+    ctx.arc(ch.x, ch.y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,90,70,0.7)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(ch.x, ch.y, r, 0, Math.PI * 2);
+    ctx.stroke();
+    // 中心集束白热点
+    ctx.fillStyle = 'rgba(255,235,220,0.85)';
+    ctx.beginPath();
+    ctx.arc(ch.x, ch.y, 4, 0, Math.PI * 2);
+    ctx.fill();
+    // 超武「湮灭·无终」：选定目标的凸包能量罩 + 逐目标覆盖光斑
+    if (ch.targets && ch.targets.length > 0) this.drawChannelHull(ch.targets, time);
+    ctx.restore();
+  }
+
+  /**
+   * 湮灭领域：几何流形由选定目标包围的图形决定——
+   * 取目标点集的凸包作能量膜（呼吸涨落的填充 + 流动虹红描边），
+   * 每个目标另罩一层脉动灼烧光斑（目标 <3 时退化为线/点）。
+   * 调用方已开启 lighter 叠加。
+   */
+  private drawChannelHull(targets: { x: number; y: number }[], time: number): void {
+    const { ctx } = this;
+    const breathe = 0.75 + Math.sin(time * 8) * 0.25;
+    // 逐目标覆盖光斑
+    for (const t of targets) {
+      const g = ctx.createRadialGradient(t.x, t.y, 0, t.x, t.y, 16);
+      g.addColorStop(0, `rgba(255,120,90,${0.5 * breathe})`);
+      g.addColorStop(1, 'rgba(255,60,40,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(t.x, t.y, 16, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    if (targets.length < 2) return;
+    if (targets.length === 2) {
+      // 两点退化：能量连线
+      ctx.strokeStyle = `rgba(255,90,70,${0.5 * breathe})`;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(targets[0].x, targets[0].y);
+      ctx.lineTo(targets[1].x, targets[1].y);
+      ctx.stroke();
+      return;
+    }
+    const hull = convexHull(targets);
+    if (hull.length < 3) return;
+    // 凸包能量膜：低透填充呼吸 + 双层描边
+    ctx.beginPath();
+    ctx.moveTo(hull[0].x, hull[0].y);
+    for (let i = 1; i < hull.length; i++) ctx.lineTo(hull[i].x, hull[i].y);
+    ctx.closePath();
+    ctx.fillStyle = `rgba(255,50,40,${0.1 + 0.06 * breathe})`;
+    ctx.fill();
+    ctx.strokeStyle = `rgba(255,90,70,${0.55 * breathe + 0.2})`;
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+    ctx.strokeStyle = `rgba(255,220,200,${0.35 * breathe})`;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    // 凸包顶点能量节点
+    ctx.fillStyle = `rgba(255,200,180,${0.7 * breathe + 0.15})`;
+    for (const v of hull) {
+      ctx.beginPath();
+      ctx.arc(v.x, v.y, 2.6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
   private drawBeams(beams: Beam[]): void {
     const { ctx } = this;
     ctx.save();
@@ -254,6 +509,24 @@ export class Renderer {
     ctx.lineCap = 'round';
     for (const b of beams) {
       const a = b.life / b.maxLife;
+      // 直线光束（激光）：宽辉光 + 白热芯，随寿命收窄淡出
+      if (b.width) {
+        ctx.globalAlpha = a * 0.45;
+        ctx.strokeStyle = b.color;
+        ctx.lineWidth = b.width * (0.6 + 0.4 * a) * 2.2;
+        ctx.beginPath();
+        ctx.moveTo(b.x1, b.y1);
+        ctx.lineTo(b.x2, b.y2);
+        ctx.stroke();
+        ctx.globalAlpha = a;
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = Math.max(1.5, b.width * a * 0.8);
+        ctx.beginPath();
+        ctx.moveTo(b.x1, b.y1);
+        ctx.lineTo(b.x2, b.y2);
+        ctx.stroke();
+        continue;
+      }
       // build a jagged path once, draw it twice (wide glow + bright core)
       const pts: [number, number][] = [[b.x1, b.y1]];
       const segs = 6;
@@ -314,6 +587,81 @@ export class Renderer {
   }
 
   /**
+   * 近战剑光：新月形刃光随时间扫过弧面（而非静态扇形）。
+   * - 前 55% 生命：刃口从一侧快速扫向另一侧（ease-out），身后留下渐薄的刃光带；
+   * - 全程：整体半径缓慢外推，像剑气飞出去；
+   * - 新月形：中段最厚、两端收尖，叠白热芯 + 刃口高光点。
+   */
+  private drawSlashes(slashes: Slash[]): void {
+    const { ctx } = this;
+    if (slashes.length === 0) return;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const sl of slashes) {
+      const g = slashGeometry(sl);
+      const { fade, sweep, reach, a0, span, lead } = g;
+      if (Math.abs(span) < 0.03) continue;
+
+      // 新月主体：沿已扫弧采样，厚度 sin 包络（两端收尖）
+      const steps = 18;
+      const thick = reach * 0.3 * (0.45 + 0.55 * fade);
+      this.crescentPath(sl.x, sl.y, a0, span, reach, thick, steps);
+      ctx.globalAlpha = fade * 0.55;
+      ctx.fillStyle = sl.color;
+      ctx.fill();
+      // 白热芯（更薄、贴外缘）
+      this.crescentPath(sl.x, sl.y, a0, span, reach - 1.5, thick * 0.42, steps);
+      ctx.globalAlpha = fade * 0.95;
+      ctx.fillStyle = '#ffffff';
+      ctx.fill();
+      // 刃口高光点：扫动期间追着刃口跑
+      if (sweep < 1) {
+        const hx = sl.x + Math.cos(lead) * (reach - thick * 0.4);
+        const hy = sl.y + Math.sin(lead) * (reach - thick * 0.4);
+        const g = ctx.createRadialGradient(hx, hy, 0, hx, hy, 14);
+        g.addColorStop(0, 'rgba(255,255,255,0.9)');
+        g.addColorStop(1, 'rgba(255,255,255,0)');
+        ctx.globalAlpha = fade;
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(hx, hy, 14, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  /** 构建新月形路径：外弧半径 r，内弧按 sin 包络向内收（两端尖、中段厚） */
+  private crescentPath(
+    cx: number,
+    cy: number,
+    a0: number,
+    span: number,
+    r: number,
+    thick: number,
+    steps: number,
+  ): void {
+    const { ctx } = this;
+    ctx.beginPath();
+    for (let i = 0; i <= steps; i++) {
+      const u = i / steps;
+      const ang = a0 + span * u;
+      const px = cx + Math.cos(ang) * r;
+      const py = cy + Math.sin(ang) * r;
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+    for (let i = steps; i >= 0; i--) {
+      const u = i / steps;
+      const ang = a0 + span * u;
+      const w = Math.sin(Math.PI * u) * thick + 1;
+      ctx.lineTo(cx + Math.cos(ang) * (r - w), cy + Math.sin(ang) * (r - w));
+    }
+    ctx.closePath();
+  }
+
+  /**
    * 实体层：敌人保持原数组顺序绘制（与旧版一致，避免逐帧按 y 重排
    * 导致密集怪群出现条带/闪烁），仅按障碍物底边分带插入：
    * y <= 底边的怪物/玩家在该障碍物之前绘制，被屋顶、树冠稳定遮挡；
@@ -333,10 +681,17 @@ export class Renderer {
       return lo;
     };
     const bands: Enemy[][] = [];
-    for (let k = 0; k <= n; k++) bands.push([]);
+    const dbands: Destructible[][] = [];
+    for (let k = 0; k <= n; k++) {
+      bands.push([]);
+      dbands.push([]);
+    }
     for (const e of s.enemies) bands[bandOf(e.y)].push(e);
+    for (const d of s.destructibles) if (d.hp > 0) dbands[bandOf(d.baseY)].push(d);
     const pBand = bandOf(s.player.y);
     for (let k = 0; k <= n; k++) {
+      // 道具先于敌人绘制（同带内作为地面物位于其后）
+      for (const d of dbands[k]) this.drawDestructible(d, s.time);
       for (const e of bands[k]) this.drawEnemy(e);
       if (k === pBand) this.drawPlayer(s.player, s.time);
       if (k < n) this.obstacles.drawRange(this.ctx, obs, k, k + 1, s.time);
@@ -381,6 +736,173 @@ export class Renderer {
     }
   }
 
+  /** 可破坏道具：各地图不同造型，受击白闪 + 该伤时显血条 */
+  private drawDestructible(d: Destructible, time: number): void {
+    const { ctx } = this;
+    const { x, y, scale: s } = d;
+    const r = DESTRUCTIBLES.radius * s;
+    // 地面接触阴影
+    ctx.fillStyle = 'rgba(0,0,0,0.32)';
+    ctx.beginPath();
+    ctx.ellipse(x, y - 2 * s, r * 1.15, r * 0.42, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    switch (this.mapId) {
+      case 'forest':
+        this.drawCrate(d, '#6b4d2a');
+        break;
+      case 'village':
+        if (d.type === 0) this.drawBarrel(d);
+        else this.drawCrate(d, '#7a5a30');
+        break;
+      case 'ruins':
+        this.drawTechCrate(d, time);
+        break;
+    }
+
+    // 受击白闪（叠加一层半透明白光）
+    if (d.hitFlash > 0) {
+      ctx.globalAlpha = Math.min(0.7, d.hitFlash / 0.09 * 0.6);
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.ellipse(d.cx, d.cy, r * 0.95, r * 1.05, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // 受损时显示血条
+    if (d.hp < d.maxHp && d.hp > 0) {
+      const bw = r * 2;
+      const pct = Math.max(0, d.hp / d.maxHp);
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(x - bw / 2, d.cy - r - 8, bw, 3.5);
+      ctx.fillStyle = '#ffd166';
+      ctx.fillRect(x - bw / 2, d.cy - r - 8, bw * pct, 3.5);
+    }
+  }
+
+  /** 木箱：木板箱体 + 十字支撑 + 顶面受光（森林/村庄通用） */
+  private drawCrate(d: Destructible, tint: string): void {
+    const { ctx } = this;
+    const { x, y, scale: s } = d;
+    const bw = 2.0 * DESTRUCTIBLES.radius * s;
+    const bh = 1.9 * DESTRUCTIBLES.radius * s;
+    const x0 = x - bw / 2;
+    const y0 = y - bh;
+    const g = ctx.createLinearGradient(0, y0, 0, y);
+    g.addColorStop(0, '#8a6636');
+    g.addColorStop(0.5, tint);
+    g.addColorStop(1, '#3f2c16');
+    ctx.fillStyle = g;
+    ctx.fillRect(x0, y0, bw, bh);
+    // 边框
+    ctx.strokeStyle = 'rgba(30,18,8,0.7)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x0 + 1, y0 + 1, bw - 2, bh - 2);
+    // 十字支撑
+    ctx.strokeStyle = 'rgba(20,12,5,0.55)';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(x0 + 2, y0 + 2);
+    ctx.lineTo(x0 + bw - 2, y - 2);
+    ctx.moveTo(x0 + bw - 2, y0 + 2);
+    ctx.lineTo(x0 + 2, y - 2);
+    ctx.stroke();
+    // 顶缘高光
+    ctx.strokeStyle = 'rgba(220,190,140,0.4)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(x0 + 2, y0 + 2.5);
+    ctx.lineTo(x0 + bw - 2, y0 + 2.5);
+    ctx.stroke();
+  }
+
+  /** 酒桶：木身 + 金属箍（废弃村庄） */
+  private drawBarrel(d: Destructible): void {
+    const { ctx } = this;
+    const { x, y, scale: s } = d;
+    const bw = 1.7 * DESTRUCTIBLES.radius * s;
+    const bh = 2.0 * DESTRUCTIBLES.radius * s;
+    const x0 = x - bw / 2;
+    const y0 = y - bh;
+    const g = ctx.createLinearGradient(x0, 0, x0 + bw, 0);
+    g.addColorStop(0, '#3a2914');
+    g.addColorStop(0.45, '#6b4d28');
+    g.addColorStop(1, '#2c1f0f');
+    ctx.fillStyle = g;
+    // 桶身（中部微鼓）
+    ctx.beginPath();
+    ctx.moveTo(x0, y0 + 3 * s);
+    ctx.quadraticCurveTo(x - bw * 0.62, y - bh / 2, x0, y - 3 * s);
+    ctx.lineTo(x0 + bw, y - 3 * s);
+    ctx.quadraticCurveTo(x + bw * 0.62, y - bh / 2, x0 + bw, y0 + 3 * s);
+    ctx.closePath();
+    ctx.fill();
+    // 金属箍
+    ctx.strokeStyle = 'rgba(180,180,190,0.5)';
+    ctx.lineWidth = 2.5 * s;
+    for (const fy of [y0 + bh * 0.22, y - bh * 0.22]) {
+      ctx.beginPath();
+      ctx.moveTo(x0 + 1, fy);
+      ctx.lineTo(x0 + bw - 1, fy);
+      ctx.stroke();
+    }
+    // 竖板缝
+    ctx.strokeStyle = 'rgba(20,12,5,0.4)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x - bw * 0.16, y0 + 4 * s);
+    ctx.lineTo(x - bw * 0.16, y - 4 * s);
+    ctx.moveTo(x + bw * 0.16, y0 + 4 * s);
+    ctx.lineTo(x + bw * 0.16, y - 4 * s);
+    ctx.stroke();
+  }
+
+  /** 霓虹能量箱：暗金属箱体 + 发光接缝（赛博废墟） */
+  private drawTechCrate(d: Destructible, time: number): void {
+    const { ctx } = this;
+    const { x, y, scale: s, seed } = d;
+    const bw = 2.0 * DESTRUCTIBLES.radius * s;
+    const bh = 1.9 * DESTRUCTIBLES.radius * s;
+    const x0 = x - bw / 2;
+    const y0 = y - bh;
+    const neon = d.type === 0 ? '#5ce1ff' : '#b56cff';
+    const g = ctx.createLinearGradient(0, y0, 0, y);
+    g.addColorStop(0, '#2a2550');
+    g.addColorStop(0.5, '#1a1440');
+    g.addColorStop(1, '#100c28');
+    ctx.fillStyle = g;
+    ctx.fillRect(x0, y0, bw, bh);
+    // 外框
+    ctx.strokeStyle = 'rgba(120,110,200,0.5)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x0 + 1, y0 + 1, bw - 2, bh - 2);
+    // 发光接缝（十字）+ 轻微脉动
+    const phase = (seed % 628) / 100;
+    const pulse = 0.55 + 0.3 * Math.sin(time * 2 + phase);
+    ctx.globalAlpha = pulse;
+    ctx.strokeStyle = neon;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x, y0 + 4);
+    ctx.lineTo(x, y - 4);
+    ctx.moveTo(x0 + 4, y - bh / 2);
+    ctx.lineTo(x0 + bw - 4, y - bh / 2);
+    ctx.stroke();
+    // 中心发光点
+    const cxp = x;
+    const cyp = y - bh / 2;
+    const glow = ctx.createRadialGradient(cxp, cyp, 0, cxp, cyp, bw * 0.55);
+    glow.addColorStop(0, neon);
+    glow.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.globalAlpha = pulse * 0.5;
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(cxp, cyp, bw * 0.55, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
   private drawProjectiles(projectiles: Projectile[], time: number): void {
     const { ctx } = this;
     ctx.save();
@@ -390,25 +912,43 @@ export class Renderer {
         continue; // drawn separately
       }
       if (p.kind === 'knife') {
-        // spinning blade with a bright edge
+        // 飞行拖尾：沿速度反方向的渐隐流光（单条，非残影），让刀的轨迹可感知
+        const sp = Math.hypot(p.vx, p.vy);
+        if (sp > 1) {
+          const tx = -p.vx / sp;
+          const ty = -p.vy / sp;
+          const len = Math.min(52, sp * 0.1);
+          const trail = ctx.createLinearGradient(p.x, p.y, p.x + tx * len, p.y + ty * len);
+          trail.addColorStop(0, 'rgba(232,238,247,0.55)');
+          trail.addColorStop(1, 'transparent');
+          ctx.strokeStyle = trail;
+          ctx.lineWidth = p.radius * 0.9;
+          ctx.lineCap = 'round';
+          ctx.beginPath();
+          ctx.moveTo(p.x, p.y);
+          ctx.lineTo(p.x + tx * len, p.y + ty * len);
+          ctx.stroke();
+        }
+        // spinning blade with a bright edge（视觉放大 1.5 倍，命中判定不变）
+        const r = p.radius * 1.5;
         ctx.save();
         ctx.translate(p.x, p.y);
         ctx.rotate(p.angle);
-        const glow = ctx.createLinearGradient(-p.radius, 0, p.radius * 1.8, 0);
+        const glow = ctx.createLinearGradient(-r, 0, r * 1.8, 0);
         glow.addColorStop(0, 'transparent');
         glow.addColorStop(1, p.color);
         ctx.fillStyle = glow;
         ctx.beginPath();
-        ctx.moveTo(p.radius * 1.8, 0);
-        ctx.lineTo(-p.radius, p.radius * 0.6);
-        ctx.lineTo(-p.radius, -p.radius * 0.6);
+        ctx.moveTo(r * 1.8, 0);
+        ctx.lineTo(-r, r * 0.6);
+        ctx.lineTo(-r, -r * 0.6);
         ctx.closePath();
         ctx.fill();
         ctx.fillStyle = '#ffffff';
         ctx.beginPath();
-        ctx.moveTo(p.radius * 1.8, 0);
-        ctx.lineTo(-p.radius * 0.2, p.radius * 0.22);
-        ctx.lineTo(-p.radius * 0.2, -p.radius * 0.22);
+        ctx.moveTo(r * 1.8, 0);
+        ctx.lineTo(-r * 0.2, r * 0.22);
+        ctx.lineTo(-r * 0.2, -r * 0.22);
         ctx.closePath();
         ctx.fill();
         ctx.restore();
@@ -517,6 +1057,9 @@ export class Renderer {
     const flash = p.hurtFlash > 0;
     const blink = p.invuln > 0 && Math.floor(time * 20) % 2 === 0;
     if (!blink) {
+      // 剑客：先画背后的剑（位于身体下方），再画身体
+      if (p.charId === 'swordsman') this.drawSwordGear(p);
+
       // body
       ctx.beginPath();
       ctx.arc(0, 0, p.radius, 0, Math.PI * 2);
@@ -533,6 +1076,7 @@ export class Renderer {
       ctx.fill();
 
       // facing indicator
+      ctx.save();
       const ang = Math.atan2(p.facing.y, p.facing.x);
       ctx.rotate(ang);
       ctx.fillStyle = '#ffd166';
@@ -542,7 +1086,103 @@ export class Renderer {
       ctx.lineTo(p.radius - 2, -4);
       ctx.closePath();
       ctx.fill();
+      ctx.restore();
+
+      // 标志性装扮（画在身体之上）
+      if (p.charId === 'mage') this.drawMageHat(p);
+      else if (p.charId === 'swordsman') this.drawHeadband(p);
     }
+    ctx.restore();
+  }
+
+  /** 法师：头顶巧帽（锥帽 + 帽檐 + 金带与帽尖星光）。坐标为玩家局部。 */
+  private drawMageHat(p: Player): void {
+    const { ctx } = this;
+    const hr = p.radius;
+    ctx.save();
+    ctx.translate(0, -hr * 0.55);
+    // 帽檐
+    ctx.fillStyle = '#3a2a6b';
+    ctx.beginPath();
+    ctx.ellipse(0, 0, hr * 1.25, hr * 0.42, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // 锥体（向右小幅倒）
+    const tipX = hr * 0.55;
+    const tipY = -hr * 2.4;
+    const grd = ctx.createLinearGradient(-hr, 0, hr, tipY);
+    grd.addColorStop(0, '#5a3fb0');
+    grd.addColorStop(1, '#281a52');
+    ctx.fillStyle = grd;
+    ctx.beginPath();
+    ctx.moveTo(-hr * 0.72, -hr * 0.05);
+    ctx.quadraticCurveTo(tipX * 0.2, -hr * 1.2, tipX, tipY);
+    ctx.quadraticCurveTo(hr * 0.55, -hr * 0.55, hr * 0.72, -hr * 0.05);
+    ctx.closePath();
+    ctx.fill();
+    // 金带
+    ctx.strokeStyle = '#ffd166';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(-hr * 0.66, -hr * 0.1);
+    ctx.quadraticCurveTo(0, -hr * 0.42, hr * 0.66, -hr * 0.1);
+    ctx.stroke();
+    // 帽尖星光
+    ctx.fillStyle = '#ffe28a';
+    ctx.beginPath();
+    ctx.arc(tipX, tipY, 2.4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  /** 剑客：红色头带 + 飘带（头部上方）。坐标为玩家局部。 */
+  private drawHeadband(p: Player): void {
+    const { ctx } = this;
+    const r = p.radius;
+    ctx.fillStyle = '#d64550';
+    ctx.fillRect(-r * 0.92, -r * 0.62, r * 1.84, r * 0.3);
+    // 向左飘动的飘带
+    ctx.beginPath();
+    ctx.moveTo(-r * 0.9, -r * 0.58);
+    ctx.lineTo(-r * 1.55, -r * 0.16);
+    ctx.lineTo(-r * 1.2, -r * 0.08);
+    ctx.lineTo(-r * 0.9, -r * 0.34);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  /** 剑客：手持长剑（朝面向方向，挥剑时随 attackAnim 沿 attackDir 扫过一道弧）。 */
+  private drawSwordGear(p: Player): void {
+    const { ctx } = this;
+    const r = p.radius;
+    const face = Math.atan2(p.facing.y, p.facing.x);
+    // 挥剑扫弧：attackAnim(0.2..0) 期间从起刃侧扫到收刃侧（ease-out，与剑光同步方向）
+    let swing = -0.35 * p.attackDir;
+    if (p.attackAnim > 0) {
+      const t = 1 - p.attackAnim / 0.2; // 0..1
+      const eased = 1 - (1 - t) ** 3;
+      swing = (-1.05 + eased * 2.1) * p.attackDir;
+    }
+    ctx.save();
+    ctx.rotate(face + swing);
+    // 护手
+    ctx.strokeStyle = '#c9a24a';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(r * 0.6, -4.5);
+    ctx.lineTo(r * 0.6, 4.5);
+    ctx.stroke();
+    // 剑身
+    const bl = r * 2.0;
+    const bgrad = ctx.createLinearGradient(r * 0.7, 0, r * 0.7 + bl, 0);
+    bgrad.addColorStop(0, '#eef3fb');
+    bgrad.addColorStop(1, '#9fb2c9');
+    ctx.fillStyle = bgrad;
+    ctx.beginPath();
+    ctx.moveTo(r * 0.7, -2.6);
+    ctx.lineTo(r * 0.7 + bl, 0);
+    ctx.lineTo(r * 0.7, 2.6);
+    ctx.closePath();
+    ctx.fill();
     ctx.restore();
   }
 
@@ -569,12 +1209,27 @@ export class Renderer {
   private drawTexts(texts: FloatingText[]): void {
     const { ctx } = this;
     ctx.textAlign = 'center';
+    ctx.lineJoin = 'round';
     for (const t of texts) {
       const a = Math.min(1, t.life * 2);
       ctx.globalAlpha = a;
-      ctx.fillStyle = t.color;
-      ctx.font = `700 ${t.size}px "Segoe UI", sans-serif`;
-      ctx.fillText(t.text, t.x, t.y);
+      if (t.crit) {
+        // 暴击：生命初期瞬间放大回弹，配暗色描边与发光，从伤害洪流中跳出
+        const pop = 1 + 0.5 * Math.max(0, t.life - 0.55) * 10;
+        ctx.font = `800 ${t.size * pop}px "Segoe UI", sans-serif`;
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = 'rgba(90,30,0,0.9)';
+        ctx.strokeText(t.text, t.x, t.y);
+        ctx.shadowColor = t.color;
+        ctx.shadowBlur = 12;
+        ctx.fillStyle = t.color;
+        ctx.fillText(t.text, t.x, t.y);
+        ctx.shadowBlur = 0;
+      } else {
+        ctx.fillStyle = t.color;
+        ctx.font = `700 ${t.size}px "Segoe UI", sans-serif`;
+        ctx.fillText(t.text, t.x, t.y);
+      }
     }
     ctx.globalAlpha = 1;
   }

@@ -160,6 +160,26 @@ body {
   position: relative;
 }
 
+/* 自动武器：中性描边；主动武器：青色发光描边（需鼠标操作） */
+.tray-slot.slot-auto {
+  border-color: rgba(160, 170, 185, 0.4);
+}
+
+.tray-slot.slot-active {
+  border-color: #7df9ff;
+  box-shadow: 0 0 8px rgba(125, 249, 255, 0.5), inset 0 0 6px rgba(125, 249, 255, 0.15);
+}
+
+/* 超武：金色发光描边，等级徽章显示 EX */
+.tray-slot.slot-evo {
+  border-color: #ffd166;
+  box-shadow: 0 0 10px rgba(255, 209, 102, 0.55), inset 0 0 7px rgba(255, 209, 102, 0.18);
+}
+
+.tray-slot .lvl.lvl-evo {
+  background: linear-gradient(180deg, #ffe9a8, #ffb340);
+}
+
 .tray-slot .lvl {
   position: absolute;
   right: -4px;
@@ -256,6 +276,175 @@ body {
   background: rgba(30, 26, 12, 0.7);
 }
 
+/* ---------------------------------------------------------------------------
+ * 超武进化卡：金色描边 + 电流缠绕边框 + 脉动泛光，三选一中一眼夺目
+ * ------------------------------------------------------------------------- */
+@property --evo-a {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+
+.card.card-evo {
+  position: relative;
+  border-color: transparent;
+  background:
+    radial-gradient(ellipse at 50% 0%, rgba(255, 209, 102, 0.14), transparent 65%),
+    rgba(16, 13, 4, 0.82);
+  animation: evo-glow 1.6s ease-in-out infinite;
+}
+
+/* 双层边框：底层金色常亮描边 + 顶层旋转的电流亮弧（conic 沿边框绕圈） */
+.card.card-evo::before {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: 16px;
+  padding: 2px;
+  background:
+    conic-gradient(
+      from var(--evo-a),
+      transparent 0turn 0.58turn,
+      rgba(255, 233, 168, 0.9) 0.68turn,
+      #7df9ff 0.74turn,
+      rgba(255, 233, 168, 0.9) 0.8turn,
+      transparent 0.9turn
+    ),
+    linear-gradient(#ffd166, #b8860b);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: evo-current 2.2s linear infinite;
+  pointer-events: none;
+}
+
+/* 第二道反向电流，交错缠绕更有能量感 */
+.card.card-evo::after {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: 16px;
+  padding: 2px;
+  background: conic-gradient(
+    from calc(var(--evo-a) * -1 + 180deg),
+    transparent 0turn 0.72turn,
+    rgba(125, 249, 255, 0.85) 0.8turn,
+    rgba(255, 255, 255, 0.95) 0.84turn,
+    transparent 0.92turn
+  );
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: evo-current 2.2s linear infinite;
+  pointer-events: none;
+}
+
+.card.card-evo:hover {
+  transform: translateY(-4px) scale(1.03);
+  background:
+    radial-gradient(ellipse at 50% 0%, rgba(255, 209, 102, 0.22), transparent 65%),
+    rgba(22, 17, 5, 0.85);
+}
+
+.card.card-evo .card-icon {
+  filter: drop-shadow(0 0 10px rgba(255, 209, 102, 0.8));
+}
+
+.card.card-evo .card-name {
+  color: #ffe9a8;
+  text-shadow: 0 0 12px rgba(255, 209, 102, 0.6);
+}
+
+@keyframes evo-current {
+  to {
+    --evo-a: 360deg;
+  }
+}
+
+@keyframes evo-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 16px rgba(255, 209, 102, 0.35), 0 0 44px rgba(255, 209, 102, 0.12);
+  }
+  50% {
+    box-shadow: 0 0 26px rgba(255, 209, 102, 0.6), 0 0 70px rgba(255, 209, 102, 0.22);
+  }
+}
+
+.tag-evo {
+  background: linear-gradient(90deg, rgba(255, 209, 102, 0.28), rgba(255, 170, 40, 0.2));
+  color: #ffd166;
+  border: 1px solid rgba(255, 209, 102, 0.5);
+}
+
+/* ---------------------------------------------------------------------------
+ * 训练模式装备配置：武器芯片点击循环等级
+ * ------------------------------------------------------------------------- */
+/* 开发者选项触发字：隐蔽不可见，避免连点时选中文本 */
+.secret-tap {
+  cursor: default;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.train-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(120px, 1fr));
+  gap: 6px;
+  max-width: 620px;
+  margin: 0 auto;
+}
+
+.train-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  cursor: pointer;
+  font-size: 12px;
+  user-select: none;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.train-chip:hover {
+  border-color: var(--accent);
+}
+
+.train-chip.on {
+  border-color: #7ee787;
+  background: rgba(126, 231, 135, 0.08);
+}
+
+.train-chip .t-icon {
+  font-size: 16px;
+}
+
+.train-chip .t-name {
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--text-dim);
+}
+
+.train-chip.on .t-name {
+  color: var(--text);
+}
+
+.train-chip .t-lvl {
+  font-weight: 800;
+  color: var(--text-dim);
+}
+
+.train-chip.on .t-lvl {
+  color: #7ee787;
+}
+
 .card-icon {
   font-size: 40px;
   line-height: 1;
@@ -275,6 +464,27 @@ body {
   padding: 2px 8px;
   border-radius: 20px;
   margin-bottom: 10px;
+}
+
+/* 武器触发方式徽章：主动（需鼠标点击）/ 自动 */
+.card-mode {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 20px;
+  margin-bottom: 10px;
+  margin-left: 6px;
+}
+
+.mode-active {
+  background: rgba(125, 249, 255, 0.16);
+  color: #7df9ff;
+}
+
+.mode-auto {
+  background: rgba(150, 160, 175, 0.14);
+  color: #9aa4b3;
 }
 
 .tag-new {
@@ -388,11 +598,44 @@ body {
 
 .pause-hint {
   position: absolute;
-  top: 16px;
+  top: 62px;
   right: 20px;
   font-size: 12px;
   color: var(--muted);
   pointer-events: none;
+}
+
+/* ---------- 静音按钮（常驻右上角） ---------- */
+.mute-btn {
+  position: absolute;
+  top: 12px;
+  right: 16px;
+  width: 42px;
+  height: 42px;
+  font-size: 20px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  color: var(--text);
+  cursor: pointer;
+  pointer-events: auto;
+  z-index: 20;
+  transition: transform 0.1s ease, border-color 0.12s ease, filter 0.12s ease;
+}
+
+.mute-btn:hover {
+  transform: translateY(-1px);
+  border-color: var(--accent);
+  filter: brightness(1.1);
+}
+
+.mute-btn.muted {
+  opacity: 0.6;
+  border-color: var(--hp);
 }
 
 /* ---------- 开始菜单：模式 / 地图选择 ---------- */

@@ -1,8 +1,16 @@
 // DOM-based UI: start menu, HUD, level-up selection, pause and game-over.
 
-import { Choice } from './skills';
+import { Choice, WEAPONS as WEAPON_REGISTRY, getWeaponDef } from './skills';
 import { formatTime } from './math';
-import { GAME_MODES, GameMode, MAPS, MapId } from './config';
+import { GAME_MODES, GameMode, MAPS, MapId, CHARACTERS, CharacterId } from './config';
+import { audio } from './audio';
+
+/** 训练模式装备项：武器 id + 等级（evolved 为超武） */
+export interface TrainLoadoutItem {
+  id: string;
+  level: number;
+  evolved: boolean;
+}
 
 export interface HudData {
   hp: number;
@@ -12,7 +20,7 @@ export interface HudData {
   level: number;
   time: number;
   kills: number;
-  tray: { icon: string; level: number }[];
+  tray: { icon: string; level: number; mode: 'auto' | 'active'; evolved: boolean }[];
   /** 限时模式：剩余秒数（存在时时间栏显示倒计时） */
   countdown?: number;
 }
@@ -36,10 +44,12 @@ export class UI {
   private killsEl!: HTMLElement;
   private trayEl!: HTMLElement;
   private hudEl!: HTMLElement;
+  private muteBtn!: HTMLElement;
 
   constructor(root: HTMLElement) {
     this.root = root;
     this.buildHud();
+    this.buildMuteButton();
   }
 
   // ---------------- HUD ----------------
@@ -79,6 +89,29 @@ export class UI {
     this.hudEl.classList.toggle('hidden', !v);
   }
 
+  // ---------------- Mute button ----------------
+  /** 常驻右上角的静音开关（与键盘 M 同步） */
+  private buildMuteButton(): void {
+    const btn = document.createElement('button');
+    btn.className = 'mute-btn';
+    btn.title = '静音 / 开启声音 (M)';
+    btn.addEventListener('click', () => this.toggleMute());
+    this.root.appendChild(btn);
+    this.muteBtn = btn;
+    this.updateMuteIcon();
+  }
+
+  private updateMuteIcon(): void {
+    this.muteBtn.textContent = audio.muted ? '🔇' : '🔊';
+    this.muteBtn.classList.toggle('muted', audio.muted);
+  }
+
+  /** 切换静音；键盘 M 与按钮点击共用 */
+  toggleMute(): void {
+    audio.toggleMute();
+    this.updateMuteIcon();
+  }
+
   updateHud(d: HudData): void {
     this.hpFill.style.transform = `scaleX(${Math.max(0, d.hp / d.maxHp)})`;
     this.hpLabel.textContent = `${Math.ceil(Math.max(0, d.hp))} / ${d.maxHp}`;
@@ -89,12 +122,13 @@ export class UI {
     this.killsEl.textContent = String(d.kills);
 
     // tray (rebuild only when count/levels change)
-    const sig = d.tray.map((t) => `${t.icon}${t.level}`).join('|');
+    const sig = d.tray.map((t) => `${t.icon}${t.level}${t.mode}${t.evolved ? 'E' : ''}`).join('|');
     if (this.trayEl.dataset.sig !== sig) {
       this.trayEl.dataset.sig = sig;
       this.trayEl.innerHTML = d.tray
         .map(
-          (t) => `<div class="tray-slot">${t.icon}<span class="lvl">${t.level}</span></div>`,
+          (t) =>
+            `<div class="tray-slot ${t.evolved ? 'slot-evo' : t.mode === 'active' ? 'slot-active' : 'slot-auto'}">${t.icon}<span class="lvl${t.evolved ? ' lvl-evo' : ''}">${t.evolved ? 'EX' : t.level}</span></div>`,
         )
         .join('');
     }
@@ -113,16 +147,35 @@ export class UI {
     return ov;
   }
 
-  showStart(onStart: (mode: GameMode, map: MapId | 'random') => void): void {
+  showStart(
+    onStart: (mode: GameMode, map: MapId | 'random', char: CharacterId, loadout: TrainLoadoutItem[] | null) => void,
+  ): void {
     this.clearOverlay();
     this.setHudVisible(false);
     let mode: GameMode = 'endless';
     let map: MapId | 'random' = 'random';
+    let char: CharacterId = 'mage';
+    // 训练模式装备：武器 id -> 等级（0 不带，9 代表 EX 超武）
+    const trainLevels = new Map<string, number>();
+    // 开发者选项：训练模式默认隐藏，连点标题「幸」字 5 下切换显隐（持久化）
+    const DEV_KEY = 'eo-devmode';
+    let devMode = localStorage.getItem(DEV_KEY) === '1';
     const modeChips = (Object.keys(GAME_MODES) as GameMode[])
+      .map((id) => {
+        // 训练模式为开发者选项，未解锁时隐藏其芯片
+        const attrs =
+          id === 'training' ? ` id="ui-train-chip"${devMode ? '' : ' style="display:none"'}` : '';
+        return `
+        <div class="select-chip ${id === mode ? 'active' : ''}" data-mode="${id}"${attrs}>
+          <b>${GAME_MODES[id].name}</b><span>${GAME_MODES[id].desc}</span>
+        </div>`;
+      })
+      .join('');
+    const charChips = (Object.keys(CHARACTERS) as CharacterId[])
       .map(
         (id) => `
-        <div class="select-chip ${id === mode ? 'active' : ''}" data-mode="${id}">
-          <b>${GAME_MODES[id].name}</b><span>${GAME_MODES[id].desc}</span>
+        <div class="select-chip ${id === char ? 'active' : ''}" data-char="${id}" title="${CHARACTERS[id].trait}">
+          <b>${CHARACTERS[id].icon} ${CHARACTERS[id].name}</b><span>${CHARACTERS[id].desc}</span>
         </div>`,
       )
       .join('');
@@ -134,18 +187,35 @@ export class UI {
         </div>`,
       )
       .join('');
+    // 训练模式武器配置芯片：点击循环 —→Lv.1→Lv.4→Lv.8→EX（可进化武器）→—
+    const trainChips = Array.from(WEAPON_REGISTRY.values())
+      .map(
+        (w) => `
+        <div class="train-chip" data-tw="${w.id}" title="${w.name}">
+          <span class="t-icon">${w.icon}</span><span class="t-name">${w.name}</span><span class="t-lvl">—</span>
+        </div>`,
+      )
+      .join('');
     const ov = this.addOverlay(`
       <div class="panel">
-        <div class="title">暗夜幸存者</div>
+        <div class="title">暗夜<span id="ui-secret" class="secret-tap">幸</span>存者</div>
         <div class="subtitle">在无尽的敌潮中生存下来。击败敌人获取经验，升级以习得或强化你的技能。</div>
         <div class="controls">
           <div><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> 或 方向键 &nbsp;移动</div>
-          <div>武器<b style="color:var(--accent)"> 自动攻击 </b>最近的敌人</div>
+          <div>自动武器<b style="color:var(--accent)"> 自动攻击 </b>敌人，主动武器用 <kbd>鼠标左键</kbd> 朝光标施放</div>
           <div><kbd>P</kbd> / <kbd>ESC</kbd> 暂停游戏</div>
+        </div>
+        <div class="select-group">
+          <div class="select-label">角色</div>
+          <div class="select-row" id="ui-chars">${charChips}</div>
         </div>
         <div class="select-group">
           <div class="select-label">模式</div>
           <div class="select-row" id="ui-modes">${modeChips}</div>
+        </div>
+        <div class="select-group" id="ui-train-group" style="display:none">
+          <div class="select-label">训练装备（点击武器循环等级；不选则用职业初始武器）</div>
+          <div class="train-grid">${trainChips}</div>
         </div>
         <div class="select-group">
           <div class="select-label">地图</div>
@@ -158,12 +228,66 @@ export class UI {
         <button class="btn" id="ui-start">开始游戏</button>
       </div>
     `);
-    // 选择切换：点击芯片高亮选中态
+    // 角色选择
+    ov.querySelectorAll<HTMLElement>('#ui-chars .select-chip').forEach((el) => {
+      el.addEventListener('click', () => {
+        ov.querySelectorAll('#ui-chars .select-chip').forEach((c) => c.classList.remove('active'));
+        el.classList.add('active');
+        char = el.dataset.char as CharacterId;
+      });
+    });
+    // 选择切换：点击芯片高亮选中态；训练模式时展开装备配置区
+    const trainGroup = ov.querySelector<HTMLElement>('#ui-train-group')!;
     ov.querySelectorAll<HTMLElement>('#ui-modes .select-chip').forEach((el) => {
       el.addEventListener('click', () => {
         ov.querySelectorAll('#ui-modes .select-chip').forEach((c) => c.classList.remove('active'));
         el.classList.add('active');
         mode = el.dataset.mode as GameMode;
+        trainGroup.style.display = mode === 'training' ? '' : 'none';
+      });
+    });
+    // 开发者选项：连点标题「幸」字 5 下切换训练模式显隐（1.5s 无点击则重置计数）
+    const trainChip = ov.querySelector<HTMLElement>('#ui-train-chip')!;
+    let secretClicks = 0;
+    let secretResetTimer = 0;
+    ov.querySelector<HTMLElement>('#ui-secret')!.addEventListener('click', () => {
+      window.clearTimeout(secretResetTimer);
+      secretResetTimer = window.setTimeout(() => (secretClicks = 0), 1500);
+      if (++secretClicks < 5) return;
+      secretClicks = 0;
+      devMode = !devMode;
+      localStorage.setItem(DEV_KEY, devMode ? '1' : '0');
+      trainChip.style.display = devMode ? '' : 'none';
+      // 关闭时若正选中训练模式，回退到无尽模式
+      if (!devMode && mode === 'training') {
+        mode = 'endless';
+        ov.querySelectorAll('#ui-modes .select-chip').forEach((c) => c.classList.remove('active'));
+        ov.querySelector('#ui-modes .select-chip[data-mode="endless"]')!.classList.add('active');
+        trainGroup.style.display = 'none';
+      }
+    });
+    // 训练装备：点击循环等级；主动武器互斥（每局限一把，与正式规则一致）
+    const lvlText = (lv: number) => (lv === 0 ? '—' : lv === 9 ? 'EX' : `Lv.${lv}`);
+    ov.querySelectorAll<HTMLElement>('.train-chip').forEach((el) => {
+      el.addEventListener('click', () => {
+        const id = el.dataset.tw!;
+        const def = getWeaponDef(id);
+        const cycle = def.evolve ? [0, 1, 4, 8, 9] : [0, 1, 4, 8];
+        const cur = trainLevels.get(id) ?? 0;
+        const next = cycle[(cycle.indexOf(cur) + 1) % cycle.length];
+        trainLevels.set(id, next);
+        if (next > 0 && def.mode === 'active') {
+          for (const other of WEAPON_REGISTRY.values()) {
+            if (other.id !== id && other.mode === 'active' && (trainLevels.get(other.id) ?? 0) > 0) {
+              trainLevels.set(other.id, 0);
+              const oel = ov.querySelector<HTMLElement>(`.train-chip[data-tw="${other.id}"]`)!;
+              oel.classList.remove('on');
+              oel.querySelector('.t-lvl')!.textContent = '—';
+            }
+          }
+        }
+        el.classList.toggle('on', next > 0);
+        el.querySelector('.t-lvl')!.textContent = lvlText(next);
       });
     });
     ov.querySelectorAll<HTMLElement>('#ui-maps .select-chip').forEach((el) => {
@@ -175,7 +299,14 @@ export class UI {
     });
     ov.querySelector<HTMLButtonElement>('#ui-start')!.addEventListener('click', () => {
       this.clearOverlay();
-      onStart(mode, map);
+      let loadout: TrainLoadoutItem[] | null = null;
+      if (mode === 'training') {
+        loadout = [];
+        for (const [id, lv] of trainLevels) {
+          if (lv > 0) loadout.push({ id, level: lv === 9 ? 8 : lv, evolved: lv === 9 });
+        }
+      }
+      onStart(mode, map, char, loadout);
     });
   }
 
@@ -184,10 +315,10 @@ export class UI {
     const cards = choices
       .map(
         (c, i) => `
-        <div class="card" data-idx="${i}">
+        <div class="card${c.type === 'evolve-weapon' ? ' card-evo' : ''}" data-idx="${i}">
           <div class="card-icon">${c.icon}</div>
           <div class="card-name">${c.name}</div>
-          <span class="card-tag ${c.tagClass}">${c.tag}</span>
+          <span class="card-tag ${c.tagClass}">${c.tag}</span>${c.mode ? `<span class="card-mode ${c.mode === 'active' ? 'mode-active' : 'mode-auto'}">${c.mode === 'active' ? '🖱 主动' : '⚙ 自动'}</span>` : ''}
           <div class="card-desc">${c.desc}</div>
           <div class="card-lvl">${c.levelText}</div>
         </div>`,

@@ -8,13 +8,17 @@ import {
   Player,
   Projectile,
   ProjectileKind,
+  Destructible,
   createGem,
+  createHeal,
   createPlayer,
+  createProjectile,
 } from './entities';
 import { Input } from './input';
-import { Renderer, Beam } from './renderer';
+import { Renderer, Beam, Slash, slashGeometry } from './renderer';
 import { Spawner } from './spawner';
-import { UI } from './ui';
+import { DestructibleField } from './destructibles';
+import { UI, TrainLoadoutItem } from './ui';
 import { angleTo, clamp, pick, rand } from './math';
 import {
   Choice,
@@ -24,15 +28,32 @@ import {
   getWeaponDef,
   recomputeStats,
 } from './skills';
-import { PLAYER, XP_CURVE, DIFFICULTY, GAME_MODES, GameMode, MapId } from './config';
+import {
+  PLAYER,
+  XP_CURVE,
+  DIFFICULTY,
+  DESTRUCTIBLES,
+  GAME_MODES,
+  GameMode,
+  MapId,
+  CharacterId,
+  CHARACTERS,
+  PASSIVES,
+  WEAPONS,
+} from './config';
+import { audio } from './audio';
 
 type State = 'menu' | 'playing' | 'levelup' | 'paused' | 'gameover';
+
+/** 可破坏道具在投射物 hit/rehit 集合中的 id 偏移，避免与敌人 id 冲突 */
+const DEST_HIT_OFFSET = 1_000_000_000;
 
 export class Game implements WeaponContext {
   private renderer: Renderer;
   private input: Input;
   private ui: UI;
   private spawner = new Spawner();
+  private destructibleField = new DestructibleField();
 
   // WeaponContext members
   player!: Player;
@@ -43,11 +64,20 @@ export class Game implements WeaponContext {
   particles: Particle[] = [];
   texts: FloatingText[] = [];
   beams: Beam[] = [];
+  slashes: Slash[] = [];
   weapons: WeaponInstance[] = [];
+  /** 本帧持续引导灼烧区（湮灭引导激活时），每帧重置；targets 为超武选定目标位置 */
+  private channelFx: { x: number; y: number; radius: number; targets: { x: number; y: number }[] | null } | null = null;
 
   private state: State = 'menu';
   private gameMode: GameMode = 'endless';
   private mapId: MapId = 'forest';
+  private charId: CharacterId = 'mage';
+  private slashDir: 1 | -1 = 1; // 近战挥砍方向（逐次交替）
+  /** 训练模式自选装备（非训练模式为 null） */
+  private trainLoadout: TrainLoadoutItem[] | null = null;
+  /** 敌人空间哈希网格（每帧重建，供分离/碰撞/范围查询共用） */
+  private enemyGrid = new Map<number, Enemy[]>();
   private kills = 0;
   private shake = 0;
   private pendingLevelUps = 0;
@@ -67,29 +97,48 @@ export class Game implements WeaponContext {
   // Lifecycle
   // ------------------------------------------------------------------
   private reset(): void {
-    this.player = createPlayer(0, 0);
+    this.player = createPlayer(0, 0, this.charId);
     this.enemies = [];
     this.projectiles = [];
     this.gems = [];
     this.particles = [];
     this.texts = [];
     this.beams = [];
+    this.slashes = [];
     this.weapons = [];
     this.kills = 0;
     this.shake = 0;
     this.pendingLevelUps = 0;
     this.spawner.reset();
+    this.destructibleField.reset();
     recomputeStats(this.player);
     this.player.hp = this.player.stats.maxHp;
-    // Starting weapon.
-    this.addWeapon('bolt');
+    // Starting weapons: training loadout if provided, otherwise the character's weapon.
+    if (this.gameMode === 'training' && this.trainLoadout && this.trainLoadout.length > 0) {
+      for (const item of this.trainLoadout) {
+        const def = getWeaponDef(item.id);
+        this.weapons.push({
+          defId: item.id,
+          level: Math.min(item.level, def.maxLevel),
+          timer: 0,
+          state: {},
+          evolved: item.evolved,
+        });
+      }
+    } else {
+      this.addWeapon(CHARACTERS[this.charId].startingWeapon);
+    }
   }
 
   /** 回到开始菜单（首次进入 / 结算后返回菜单共用） */
   private showMenu(): void {
     this.state = 'menu';
+    audio.stopMusic();
     this.ui.setHudVisible(false);
-    this.ui.showStart((mode, map) => this.start(mode, this.resolveMap(map)));
+    this.ui.showStart((mode, map, char, loadout) => {
+      this.trainLoadout = loadout;
+      this.start(mode, this.resolveMap(map), char);
+    });
   }
 
   /** 'random' 时从三张地图中随机取一（每局重随） */
@@ -98,21 +147,26 @@ export class Game implements WeaponContext {
     return map;
   }
 
-  private start(mode: GameMode, map: MapId): void {
+  private start(mode: GameMode, map: MapId, char: CharacterId): void {
     this.gameMode = mode;
     this.mapId = map;
+    this.charId = char;
     this.renderer.setMap(map);
+    this.destructibleField.setMap(map);
     this.reset();
     this.state = 'playing';
     this.ui.setHudVisible(true);
+    audio.startMusic();
   }
 
   private restart(): void {
     // 再来一局：沿用当前 gameMode / mapId
     this.renderer.setMap(this.mapId);
+    this.destructibleField.setMap(this.mapId);
     this.reset();
     this.state = 'playing';
     this.ui.setHudVisible(true);
+    audio.startMusic();
   }
 
   // ------------------------------------------------------------------
@@ -132,11 +186,15 @@ export class Game implements WeaponContext {
     this.renderer.render({
       player: this.player,
       enemies: this.enemies,
+      destructibles: this.destructibleField.active,
       projectiles: this.projectiles,
       gems: this.gems,
       particles: this.particles,
       texts: this.texts,
       beams: this.beams,
+      slashes: this.slashes,
+      aim: this.aimState(),
+      channel: this.channelFx,
       time: this.spawner.time,
       shake: this.shake,
     });
@@ -150,7 +208,10 @@ export class Game implements WeaponContext {
         level: this.player.level,
         time: this.spawner.time,
         kills: this.kills,
-        tray: this.weapons.map((w) => ({ icon: getWeaponDef(w.defId).icon, level: w.level })),
+        tray: this.weapons.map((w) => {
+          const def = getWeaponDef(w.defId);
+          return { icon: def.icon, level: w.level, mode: def.mode ?? 'auto', evolved: !!w.evolved };
+        }),
         ...(this.gameMode === 'timed'
           ? { countdown: GAME_MODES.timed.duration - this.spawner.time }
           : {}),
@@ -162,18 +223,22 @@ export class Game implements WeaponContext {
   }
 
   private handleGlobalKeys(): void {
+    if (this.input.justPressed('m')) this.ui.toggleMute();
     if ((this.input.justPressed('p') || this.input.justPressed('escape'))) {
       if (this.state === 'playing') {
         this.state = 'paused';
+        audio.duckMusic(true);
         this.ui.showPause(
           () => {
             this.state = 'playing';
+            audio.duckMusic(false);
           },
           () => this.restart(),
           () => this.showMenu(),
         );
       } else if (this.state === 'paused') {
         this.state = 'playing';
+        audio.duckMusic(false);
         this.ui.hidePause();
       }
     }
@@ -200,24 +265,33 @@ export class Game implements WeaponContext {
     }
     p.invuln = Math.max(0, p.invuln - dt);
     p.hurtFlash = Math.max(0, p.hurtFlash - dt);
+    p.attackAnim = Math.max(0, p.attackAnim - dt);
     this.shake = Math.max(0, this.shake - dt * 40);
 
     // Weapons
+    this.channelFx = null;
     for (const w of this.weapons) {
       getWeaponDef(w.defId).update(dt, this, w);
     }
 
-    // Spawning (no alive-enemy cap)
+    // Spawning (no alive cap by design — 无尽敌潮是核心爽感)
     const spawn = this.spawner.update(dt, p.x, p.y, this.renderer.width, this.renderer.height);
     for (const e of spawn.enemies) this.enemies.push(e);
+    if (spawn.bossSpawned) {
+      audio.bossWarn();
+      this.shake = Math.max(this.shake, 14);
+    }
 
     this.updateEnemies(dt);
     this.collideObstacles();
+    this.updateDestructibles(dt);
+    this.collideDestructibles();
     this.updateProjectiles(dt);
     this.updateGems(dt);
     this.updateParticles(dt);
     this.updateTexts(dt);
     this.updateBeams(dt);
+    this.updateSlashes(dt);
 
     this.collideProjectiles();
     this.collidePlayer(dt);
@@ -278,28 +352,61 @@ export class Game implements WeaponContext {
         }
       }
     }
+    this.rebuildEnemyGrid();
     this.separateEnemies();
+  }
+
+  // ------------------------------------------------------------------
+  // 敌人空间哈希网格：每帧重建一次，分离/投射物碰撞/玩家碰撞/黑洞等共用，
+  // 避免多处 O(投射物×敌人) 全表扫描。key 用数字避免每帧大量临时字符串。
+  // ------------------------------------------------------------------
+  private static readonly GRID_CELL = 48;
+  /** 敌人最大半径（boss 44）+ 网格建成后分离/推离造成的位移宽容 */
+  private static readonly GRID_SLACK = 52;
+
+  private gridKey(cx: number, cy: number): number {
+    return (cx + 32768) * 65536 + (cy + 32768);
+  }
+
+  private rebuildEnemyGrid(): void {
+    this.enemyGrid.clear();
+    const cell = Game.GRID_CELL;
+    for (const e of this.enemies) {
+      const k = this.gridKey(Math.floor(e.x / cell), Math.floor(e.y / cell));
+      let arr = this.enemyGrid.get(k);
+      if (!arr) this.enemyGrid.set(k, (arr = []));
+      arr.push(e);
+    }
+  }
+
+  /** 遍历可能与圆 (x,y,r) 相交的敌人（已含敌人半径与位移宽容）；回调返回 true 时提前终止 */
+  private forEachEnemyNear(x: number, y: number, r: number, fn: (e: Enemy) => boolean | void): void {
+    const cell = Game.GRID_CELL;
+    const reach = r + Game.GRID_SLACK;
+    const cx0 = Math.floor((x - reach) / cell);
+    const cy0 = Math.floor((y - reach) / cell);
+    const cx1 = Math.floor((x + reach) / cell);
+    const cy1 = Math.floor((y + reach) / cell);
+    for (let cx = cx0; cx <= cx1; cx++) {
+      for (let cy = cy0; cy <= cy1; cy++) {
+        const arr = this.enemyGrid.get(this.gridKey(cx, cy));
+        if (!arr) continue;
+        for (const e of arr) {
+          if (fn(e)) return;
+        }
+      }
+    }
   }
 
   /** Light grid-based separation so enemies don't fully overlap. */
   private separateEnemies(): void {
-    const cell = 48;
-    const grid = new Map<string, Enemy[]>();
-    const key = (cx: number, cy: number) => `${cx},${cy}`;
-    for (const e of this.enemies) {
-      const cx = Math.floor(e.x / cell);
-      const cy = Math.floor(e.y / cell);
-      const k = key(cx, cy);
-      let arr = grid.get(k);
-      if (!arr) grid.set(k, (arr = []));
-      arr.push(e);
-    }
+    const cell = Game.GRID_CELL;
     for (const e of this.enemies) {
       const cx = Math.floor(e.x / cell);
       const cy = Math.floor(e.y / cell);
       for (let ox = -1; ox <= 1; ox++) {
         for (let oy = -1; oy <= 1; oy++) {
-          const arr = grid.get(key(cx + ox, cy + oy));
+          const arr = this.enemyGrid.get(this.gridKey(cx + ox, cy + oy));
           if (!arr) continue;
           for (const o of arr) {
             if (o === e) continue;
@@ -351,15 +458,26 @@ export class Game implements WeaponContext {
       } else {
         pr.x += pr.vx * dt;
         pr.y += pr.vy * dt;
-        // Summoned knives roam the screen, bouncing off its edges.
+        // 飞刀在以玩家为圆心的固定巡游圆内乱飞（世界坐标，与窗口尺寸无关），
+        // 碰到圆周按法线镜面反射弹回。
         if (pr.kind === 'knife') {
-          const halfW = this.renderer.width / 2 - pr.radius;
-          const halfH = this.renderer.height / 2 - pr.radius;
-          if (pr.x < p.x - halfW) { pr.x = p.x - halfW; pr.vx = Math.abs(pr.vx); }
-          else if (pr.x > p.x + halfW) { pr.x = p.x + halfW; pr.vx = -Math.abs(pr.vx); }
-          if (pr.y < p.y - halfH) { pr.y = p.y - halfH; pr.vy = Math.abs(pr.vy); }
-          else if (pr.y > p.y + halfH) { pr.y = p.y + halfH; pr.vy = -Math.abs(pr.vy); }
-          pr.angle = Math.atan2(pr.vy, pr.vx);
+          const R = WEAPONS.dagger.roamRadius - pr.radius;
+          const dx = pr.x - p.x;
+          const dy = pr.y - p.y;
+          const d2 = dx * dx + dy * dy;
+          if (d2 > R * R) {
+            const d = Math.sqrt(d2) || 1;
+            const nx = dx / d;
+            const ny = dy / d;
+            pr.x = p.x + nx * R;
+            pr.y = p.y + ny * R;
+            const dot = pr.vx * nx + pr.vy * ny;
+            if (dot > 0) {
+              pr.vx -= 2 * dot * nx;
+              pr.vy -= 2 * dot * ny;
+            }
+            pr.angle = Math.atan2(pr.vy, pr.vx);
+          }
         }
       }
       // Shockwave expands outward.
@@ -368,17 +486,17 @@ export class Game implements WeaponContext {
       if (pr.pull > 0) {
         const reach = pr.radius * 1.8;
         const reach2 = reach * reach;
-        for (const e of this.enemies) {
-          if (e.hp <= 0) continue;
+        this.forEachEnemyNear(pr.x, pr.y, reach, (e) => {
+          if (e.hp <= 0) return;
           const dx = pr.x - e.x;
           const dy = pr.y - e.y;
           const d2 = dx * dx + dy * dy;
-          if (d2 > reach2 || d2 < 1) continue;
+          if (d2 > reach2 || d2 < 1) return;
           const d = Math.sqrt(d2);
           const strength = pr.pull * (1 - d / reach);
           e.x += (dx / d) * strength * dt;
           e.y += (dy / d) * strength * dt;
-        }
+        });
       }
       // decrement re-hit cooldowns
       if (pr.rehitInterval > 0 && pr.rehit.size) {
@@ -408,7 +526,12 @@ export class Game implements WeaponContext {
         g.y += Math.sin(ang) * speed * dt;
       }
       if (d2 < (p.radius + 6) ** 2) {
-        this.addXp(g.value);
+        if (g.heal) {
+          p.hp = Math.min(p.stats.maxHp, p.hp + g.heal);
+          this.addText(`+${g.heal}`, p.x, p.y - p.radius, '#7ee787', 15);
+        } else {
+          this.addXp(g.value);
+        }
       } else {
         remaining.push(g);
       }
@@ -449,58 +572,197 @@ export class Game implements WeaponContext {
     this.beams = alive;
   }
 
+  private updateSlashes(dt: number): void {
+    const alive: Slash[] = [];
+    for (const sl of this.slashes) {
+      sl.life -= dt;
+      if (sl.life <= 0) continue;
+      // 剑光存活期间持续判定：谁在已扫亮的刃光区里谁挨刀（每目标只结一次）
+      if (sl.dmg) this.applySlashDamage(sl);
+      alive.push(sl);
+    }
+    this.slashes = alive;
+  }
+
+  /** 剑光命中判定：与渲染共用 slashGeometry，视觉盖到哪、伤害就到哪 */
+  private applySlashDamage(sl: Slash): void {
+    const g = slashGeometry(sl);
+    const swept = Math.abs(g.span);
+    if (swept < 0.01) return;
+    const tol = 0.06; // 刃缘宽容，避免擦边目标被判在外
+    this.forEachEnemyNear(sl.x, sl.y, g.reach, (e) => {
+      if (e.hp <= 0 || sl.hit!.has(e.id)) return;
+      const dx = e.x - sl.x;
+      const dy = e.y - sl.y;
+      const rr = g.reach + e.radius;
+      if (dx * dx + dy * dy > rr * rr) return;
+      const rel = this.angleDelta(Math.atan2(dy, dx), g.a0) * sl.dir;
+      if (rel >= -tol && rel <= swept + tol) {
+        sl.hit!.add(e.id);
+        this.damageEnemy(e, sl.dmg!, sl.x, sl.y, sl.knockback!);
+      }
+    });
+    for (const d of this.destructibleField.active) {
+      const key = DEST_HIT_OFFSET + d.id;
+      if (d.hp <= 0 || sl.hit!.has(key)) continue;
+      const dx = d.cx - sl.x;
+      const dy = d.cy - sl.y;
+      const rr = g.reach + d.r;
+      if (dx * dx + dy * dy > rr * rr) continue;
+      const rel = this.angleDelta(Math.atan2(dy, dx), g.a0) * sl.dir;
+      if (rel >= -tol && rel <= swept + tol) {
+        sl.hit!.add(key);
+        this.damageDestructible(d, sl.dmg!);
+      }
+    }
+  }
+
   // ------------------------------------------------------------------
   // Collisions
   // ------------------------------------------------------------------
   private collideProjectiles(): void {
     for (const pr of this.projectiles) {
       if (pr.kind === 'lightning') continue; // instant, handled at fire time
-      for (const e of this.enemies) {
-        if (e.hp <= 0) continue;
+      // 网格范围查询代替全表扫描（原 O(投射物×敌人) 是主热点）
+      this.forEachEnemyNear(pr.x, pr.y, pr.radius, (e) => {
+        if (e.hp <= 0) return;
         const rr = (pr.radius + e.radius) ** 2;
         const d2 = (pr.x - e.x) ** 2 + (pr.y - e.y) ** 2;
-        if (d2 > rr) continue;
+        if (d2 > rr) return;
 
         if (pr.rehitInterval > 0) {
           // persistent (orbit / aura / frost / blackhole): re-hit on interval
-          if (pr.rehit.has(e.id)) continue;
+          if (pr.rehit.has(e.id)) return;
           this.damageEnemy(e, pr.damage, pr.x, pr.y, pr.knockback);
           this.applyStatus(e, pr.slowMul, pr.slowDuration, pr.stunDuration);
           pr.rehit.set(e.id, pr.rehitInterval);
         } else {
           // single-hit / piercing
-          if (pr.hit.has(e.id)) continue;
+          if (pr.hit.has(e.id)) return;
           this.damageEnemy(e, pr.damage, pr.x, pr.y, pr.knockback);
           this.applyStatus(e, pr.slowMul, pr.slowDuration, pr.stunDuration);
           pr.hit.add(e.id);
           pr.pierceLeft -= 1;
           if (pr.pierceLeft <= 0) {
             pr.life = 0;
-            break;
+            return true; // 穿透耗尽，提前终止
           }
         }
+      });
+      if (pr.life <= 0) continue;
+      // 投射物也打可破坏道具（穿过道具、不消耗穿透，避免道具替敌人挡弹）
+      for (const d of this.destructibleField.active) {
+        if (d.hp <= 0) continue;
+        const rr = (pr.radius + d.r) ** 2;
+        const dx = pr.x - d.cx;
+        const dy = pr.y - d.cy;
+        if (dx * dx + dy * dy > rr) continue;
+        const key = DEST_HIT_OFFSET + d.id;
+        if (pr.rehitInterval > 0) {
+          if (pr.rehit.has(key)) continue;
+          this.damageDestructible(d, pr.damage);
+          pr.rehit.set(key, pr.rehitInterval);
+        } else {
+          if (pr.hit.has(key)) continue;
+          this.damageDestructible(d, pr.damage);
+          pr.hit.add(key);
+        }
       }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // 可破坏道具
+  // ------------------------------------------------------------------
+  /** 生成/剔除跟随玩家的道具，并衰减受击白闪 */
+  private updateDestructibles(dt: number): void {
+    this.destructibleField.update(this.player.x, this.player.y);
+    for (const d of this.destructibleField.active) {
+      if (d.hitFlash > 0) d.hitFlash = Math.max(0, d.hitFlash - dt);
+    }
+  }
+
+  /** 道具仅阻挡玩家（敌人不受阻，避免堆积） */
+  private collideDestructibles(): void {
+    const p = this.player;
+    for (const d of this.destructibleField.active) {
+      if (d.hp <= 0) continue;
+      const dx = p.x - d.cx;
+      const dy = p.y - d.cy;
+      const minD = p.radius + d.r;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < minD * minD && d2 > 0.0001) {
+        const dist = Math.sqrt(d2);
+        p.x = d.cx + (dx / dist) * minD;
+        p.y = d.cy + (dy / dist) * minD;
+      }
+    }
+  }
+
+  private damageDestructible(d: Destructible, dmg: number): void {
+    if (d.hp <= 0) return;
+    const crit = Math.random() < this.player.stats.critChance;
+    const final = Math.max(1, Math.round(dmg * (crit ? this.player.stats.critMult : 1)));
+    d.hp -= final;
+    d.hitFlash = 0.09;
+    if (crit) this.addText(String(final), d.cx, d.cy - d.r, '#ffd166', 20, true);
+    else this.addText(String(final), d.cx, d.cy - d.r, '#ffffff', 12);
+    if (d.hp <= 0) this.destroyDestructible(d);
+  }
+
+  /** 道具被打碎：碎裂粒子 + 小概率掉经验/血包/爆炸（各项独立判定） */
+  private destroyDestructible(d: Destructible): void {
+    const debris = this.mapId === 'ruins' ? '#8a7bff' : '#b58a4e';
+    this.spawnParticles(d.cx, d.cy, debris, 14, 150);
+    this.destructibleField.markDestroyed(d);
+    const drop = DESTRUCTIBLES.drop;
+    if (Math.random() < drop.xpChance) {
+      this.gems.push(createGem(d.cx, d.cy, drop.xpValue));
+    }
+    if (Math.random() < drop.healChance) {
+      this.gems.push(createHeal(d.cx + rand(-6, 6), d.cy + rand(-6, 6), drop.healAmount));
+    }
+    if (Math.random() < drop.explodeChance) {
+      const start = 24;
+      const life = 0.42;
+      this.projectiles.push(
+        createProjectile({
+          kind: 'shock',
+          x: d.cx,
+          y: d.cy,
+          radius: start,
+          damage: drop.explodeDamage,
+          pierceLeft: 9999,
+          life,
+          color: '#ffb454',
+          knockback: drop.explodeKnockback,
+          growth: (drop.explodeRadius - start) / life,
+        }),
+      );
+      this.spawnParticles(d.cx, d.cy, '#ffcf87', 20, 220);
+      this.shake = Math.max(this.shake, 8);
     }
   }
 
   private collidePlayer(_dt: number): void {
     const p = this.player;
     if (p.invuln > 0) return;
-    for (const e of this.enemies) {
-      if (e.hp <= 0) continue;
+    this.forEachEnemyNear(p.x, p.y, p.radius, (e) => {
+      if (e.hp <= 0) return;
       const rr = (p.radius + e.radius) ** 2;
       const d2 = (p.x - e.x) ** 2 + (p.y - e.y) ** 2;
       if (d2 < rr) {
-        const dmg = Math.max(1, e.damage - p.stats.armor);
+        const reduction = p.stats.armor / (p.stats.armor + PASSIVES.armorDmgRatio * e.damage);
+        const dmg = Math.max(1, Math.round(e.damage * (1 - reduction)));
         p.hp -= dmg;
         p.invuln = PLAYER.invulnTime;
         p.hurtFlash = 0.15;
         this.shake = 10;
         this.addText(`-${dmg}`, p.x, p.y - p.radius, '#ff6b6b', 16);
         this.spawnParticles(p.x, p.y, '#ff6b6b', 8, 120);
-        break;
+        return true; // 本帧只吃一次接触伤害
       }
-    }
+    });
   }
 
   // ------------------------------------------------------------------
@@ -538,12 +800,203 @@ export class Game implements WeaponContext {
     const ang = angleTo(fromX, fromY, e.x, e.y);
     e.kx += Math.cos(ang) * knockback;
     e.ky += Math.sin(ang) * knockback;
-    this.addText(String(final), e.x, e.y - e.radius, crit ? '#ffd166' : '#ffffff', crit ? 18 : 13);
+    if (crit) {
+      this.addText(String(final), e.x, e.y - e.radius, '#ffd166', 22, true);
+    } else {
+      this.addText(String(final), e.x, e.y - e.radius, '#ffffff', 13);
+    }
     if (e.hp <= 0) this.killEnemy(e);
   }
 
   addBeam(x1: number, y1: number, x2: number, y2: number, color: string): void {
     this.beams.push({ x1, y1, x2, y2, color, life: 0.14, maxLife: 0.14 });
+  }
+
+  /** 鼠标位置换算到世界坐标（相机始终以玩家为中心，不计震屏偏移） */
+  aimWorld(): { x: number; y: number } {
+    return {
+      x: this.player.x + (this.input.mouse.x - this.renderer.width / 2),
+      y: this.player.y + (this.input.mouse.y - this.renderer.height / 2),
+    };
+  }
+
+  fireJustPressed(): boolean {
+    return this.input.clickJustPressed();
+  }
+
+  fireHeld(): boolean {
+    return this.input.mouseIsDown();
+  }
+
+  /** 主动武器瞄准态：持有主动武器时返回准星位置与充能进度/颜色，供渲染准星；否则 null */
+  private aimState(): { x: number; y: number; ready: boolean; charge: number; color: string } | null {
+    const inst = this.weapons.find((w) => getWeaponDef(w.defId).mode === 'active');
+    if (!inst) return null;
+    const aim = this.aimWorld();
+    if (inst.defId === 'laser') {
+      const cd = WEAPONS.laser.cd[inst.level] / this.player.stats.attackSpeedMult;
+      const charge = cd > 0 ? clamp(1 - inst.timer / cd, 0, 1) : 1;
+      return { x: aim.x, y: aim.y, ready: inst.timer <= 0, charge, color: '#7df9ff' };
+    }
+    // 持续引导（湮灭引导）：准星反映充能槽；耗尽断线时显示回充进度；超武恒满
+    if (inst.evolved) {
+      return { x: aim.x, y: aim.y, ready: true, charge: 1, color: '#ff5a5a' };
+    }
+    const maxE = WEAPONS.channel.energyMax[inst.level];
+    const energy = inst.state.energy ?? maxE;
+    const locked = inst.state.locked === 1;
+    return {
+      x: aim.x,
+      y: aim.y,
+      ready: !locked && energy > 0,
+      charge: clamp(energy / maxE, 0, 1),
+      color: '#ff5a5a',
+    };
+  }
+
+  /** 持续引导：标记本帧圆形灼烧区（供渲染），dealDamage 时结算一次区域伤害。
+   *  maxTargets（超武）：取距圆心最近的至多 N 只敌人作为选定目标，
+   *  选定目标位置每帧传给渲染层画凸包能量罩。 */
+  channel(
+    ax: number,
+    ay: number,
+    radius: number,
+    dmg: number,
+    knockback: number,
+    dealDamage: boolean,
+    maxTargets?: number,
+  ): void {
+    let targets: Enemy[] | null = null;
+    if (maxTargets !== undefined) {
+      // 收集圈内敌人，按距圆心排序取最近的 maxTargets 只
+      const inRange: { e: Enemy; d2: number }[] = [];
+      this.forEachEnemyNear(ax, ay, radius, (e) => {
+        if (e.hp <= 0) return;
+        const dx = e.x - ax;
+        const dy = e.y - ay;
+        const rr = radius + e.radius;
+        const d2 = dx * dx + dy * dy;
+        if (d2 <= rr * rr) inRange.push({ e, d2 });
+      });
+      inRange.sort((a, b) => a.d2 - b.d2);
+      targets = inRange.slice(0, maxTargets).map((t) => t.e);
+    }
+    this.channelFx = {
+      x: ax,
+      y: ay,
+      radius,
+      targets: targets ? targets.map((e) => ({ x: e.x, y: e.y })) : null,
+    };
+    if (dealDamage) {
+      if (targets) {
+        for (const e of targets) this.damageEnemy(e, dmg, ax, ay, knockback);
+      } else {
+        this.forEachEnemyNear(ax, ay, radius, (e) => {
+          if (e.hp <= 0) return;
+          const dx = e.x - ax;
+          const dy = e.y - ay;
+          const rr = radius + e.radius;
+          if (dx * dx + dy * dy <= rr * rr) this.damageEnemy(e, dmg, ax, ay, knockback);
+        });
+      }
+      // 道具不占目标名额，圈内照常灼烧
+      for (const d of this.destructibleField.active) {
+        if (d.hp <= 0) continue;
+        const dx = d.cx - ax;
+        const dy = d.cy - ay;
+        const rr = radius + d.r;
+        if (dx * dx + dy * dy <= rr * rr) this.damageDestructible(d, dmg);
+      }
+      // 灼烧冲击粒子
+      this.spawnParticles(ax + rand(-radius * 0.4, radius * 0.4), ay + rand(-radius * 0.4, radius * 0.4), '#ff6b5a', 4, 120);
+    }
+  }
+
+  laserBlast(
+    x: number,
+    y: number,
+    angle: number,
+    range: number,
+    halfWidth: number,
+    dmg: number,
+    knockback: number,
+  ): void {
+    const dx = Math.cos(angle);
+    const dy = Math.sin(angle);
+    const x2 = x + dx * range;
+    const y2 = y + dy * range;
+    // 命中判定：点到线段距离 ≤ 光束半宽 + 目标半径（沿光束方向投影后钳制）
+    const hitAlong = (ex: number, ey: number, er: number): boolean => {
+      const px = ex - x;
+      const py = ey - y;
+      const t = clamp(px * dx + py * dy, 0, range);
+      const cx = x + dx * t;
+      const cy = y + dy * t;
+      const rr = halfWidth + er;
+      return (ex - cx) ** 2 + (ey - cy) ** 2 <= rr * rr;
+    };
+    this.forEachEnemyNear(x + dx * range * 0.5, y + dy * range * 0.5, range * 0.5 + halfWidth, (e) => {
+      if (e.hp <= 0) return;
+      if (hitAlong(e.x, e.y, e.radius)) {
+        this.damageEnemy(e, dmg, e.x - dx * 10, e.y - dy * 10, knockback);
+      }
+    });
+    for (const d of this.destructibleField.active) {
+      if (d.hp > 0 && hitAlong(d.cx, d.cy, d.r)) this.damageDestructible(d, dmg);
+    }
+    // 光束特效（直线模式）+ 枪口/末端粒子 + 震屏
+    this.beams.push({ x1: x, y1: y, x2, y2, color: '#7df9ff', life: 0.2, maxLife: 0.2, width: halfWidth * 2 });
+    this.spawnParticles(x + dx * 30, y + dy * 30, '#bffcff', 6, 180);
+    this.spawnParticles(x2, y2, '#7df9ff', 8, 160);
+    this.shake = Math.max(this.shake, 6);
+  }
+
+  meleeSwing(
+    x: number,
+    y: number,
+    angle: number,
+    reach: number,
+    arcHalf: number,
+    dmg: number,
+    knockback: number,
+  ): void {
+    // 逐次交替扫动方向，左右互斩更有挥砍感
+    this.slashDir = this.slashDir === 1 ? -1 : 1;
+    this.player.attackAnim = 0.2; // 触发挥剑动画
+    this.player.attackDir = this.slashDir;
+    // 剑光实体：伤害不在此处瞬时结算，而由 updateSlashes 随刃光扫过持续判定，
+    // 避免“剑气看着能盖到但没伤害”的错位感。
+    const sl: Slash = {
+      x,
+      y,
+      angle,
+      reach,
+      arcHalf,
+      dir: this.slashDir,
+      life: 0.22,
+      maxLife: 0.22,
+      color: '#cfe6ff',
+      dmg,
+      knockback,
+      hit: new Set<number>(),
+    };
+    this.slashes.push(sl);
+    this.applySlashDamage(sl); // 首帧立即判一次，保证贴脸目标手感不延迟
+    this.spawnParticles(
+      x + Math.cos(angle) * reach * 0.8,
+      y + Math.sin(angle) * reach * 0.8,
+      '#dfe9ff',
+      3,
+      130,
+    );
+  }
+
+  /** 两角度差归一化到 [-PI, PI] */
+  private angleDelta(a: number, b: number): number {
+    let d = a - b;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    return d;
   }
 
   applyStatus(e: Enemy, slowMul: number, slowDuration: number, stunDuration: number): void {
@@ -566,7 +1019,10 @@ export class Game implements WeaponContext {
   private killEnemy(e: Enemy): void {
     this.kills++;
     this.spawnParticles(e.x, e.y, e.color, e.kind === 'boss' ? 40 : 10, 160);
-    if (e.kind === 'boss') this.shake = 16;
+    if (e.kind === 'boss') {
+      this.shake = 16;
+      audio.bossDie();
+    }
     // Drop XP. Bosses drop a big cluster.
     if (e.kind === 'boss') {
       for (let i = 0; i < 8; i++) {
@@ -594,6 +1050,9 @@ export class Game implements WeaponContext {
   }
 
   private openLevelUp(): void {
+    if (this.state !== 'levelup') {
+      audio.duckMusic(true);
+    }
     this.state = 'levelup';
     this.rerollAvailable = true; // one free re-roll per level-up
     this.presentChoices();
@@ -606,6 +1065,7 @@ export class Game implements WeaponContext {
       this.pendingLevelUps = 0;
       this.player.hp = Math.min(this.player.stats.maxHp, this.player.hp + 20);
       this.state = 'playing';
+      audio.duckMusic(false);
       return;
     }
     const onReroll = this.rerollAvailable
@@ -627,6 +1087,14 @@ export class Game implements WeaponContext {
         if (inst) inst.level++;
         break;
       }
+      case 'evolve-weapon': {
+        // 超武进化：质变而非加级，金色爆发庆祝
+        const inst = this.weapons.find((w) => w.defId === c.id);
+        if (inst) inst.evolved = true;
+        this.spawnParticles(this.player.x, this.player.y, '#ffe9a8', 40, 320);
+        this.shake = Math.max(this.shake, 10);
+        break;
+      }
       case 'new-passive':
       case 'upgrade-passive': {
         const cur = this.player.passives.get(c.id) ?? 0;
@@ -641,6 +1109,7 @@ export class Game implements WeaponContext {
       this.openLevelUp();
     } else {
       this.state = 'playing';
+      audio.duckMusic(false);
     }
   }
 
@@ -650,6 +1119,7 @@ export class Game implements WeaponContext {
 
   private gameOver(victory: boolean): void {
     this.state = 'gameover';
+    audio.stopMusic();
     this.ui.setHudVisible(false);
     this.ui.showGameOver(
       { time: this.spawner.time, level: this.player.level, kills: this.kills, victory },
@@ -661,10 +1131,10 @@ export class Game implements WeaponContext {
   // ------------------------------------------------------------------
   // FX helpers
   // ------------------------------------------------------------------
-  private addText(text: string, x: number, y: number, color: string, size: number): void {
+  private addText(text: string, x: number, y: number, color: string, size: number, crit = false): void {
     // cap floating texts to avoid clutter
     if (this.texts.length > 120) this.texts.shift();
-    this.texts.push({ x: x + rand(-4, 4), y, vy: -40, life: 0.7, text, color, size });
+    this.texts.push({ x: x + rand(-4, 4), y, vy: -40, life: 0.7, text, color, size, crit });
   }
 
   private spawnParticles(x: number, y: number, color: string, count: number, speed: number): void {

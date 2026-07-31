@@ -10,7 +10,7 @@ import {
   createProjectile,
 } from './entities';
 import { angleTo, dist } from './math';
-import { WEAPONS as W, PASSIVES as PT, PROGRESSION, PLAYER } from './config';
+import { WEAPONS as W, PASSIVES as PT, PROGRESSION, PLAYER, CHARACTERS } from './config';
 
 /** What a weapon needs from the game world to do its job. Game implements this. */
 export interface WeaponContext {
@@ -22,6 +22,19 @@ export interface WeaponContext {
   damageEnemy(e: Enemy, dmg: number, fromX: number, fromY: number, knockback: number): void;
   applyStatus(e: Enemy, slowMul: number, slowDuration: number, stunDuration: number): void;
   addBeam(x1: number, y1: number, x2: number, y2: number, color: string): void;
+  /** 近战扇形挥砍：以 (x,y) 为支点、angle 为中心方向、arcHalf 为半张角，瞬时命中 reach 内敌人与道具并生成剑光 */
+  meleeSwing(x: number, y: number, angle: number, reach: number, arcHalf: number, dmg: number, knockback: number): void;
+  /** 鼠标在世界坐标系的位置（主动武器瞄准用） */
+  aimWorld(): { x: number; y: number };
+  /** 本帧鼠标左键是否刚在画布上按下 */
+  fireJustPressed(): boolean;
+  /** 鼠标左键是否正被按住（持续引导武器） */
+  fireHeld(): boolean;
+  /** 激光瞬发：从 (x,y) 沿 angle 方向的线段命中所有敌人/道具，并生成光束特效 */
+  laserBlast(x: number, y: number, angle: number, range: number, halfWidth: number, dmg: number, knockback: number): void;
+  /** 持续引导：标记本帧在 (ax,ay) 为心、radius 为半径的圆形区激活（供渲染赤色能量）；
+   *  dealDamage 为 true 时同时结算一次区域伤害；maxTargets 限制同时选定的敌人数（取距圆心最近者，超武用） */
+  channel(ax: number, ay: number, radius: number, dmg: number, knockback: number, dealDamage: boolean, maxTargets?: number): void;
 }
 
 export interface WeaponInstance {
@@ -29,6 +42,8 @@ export interface WeaponInstance {
   level: number;
   timer: number;
   state: Record<string, number>;
+  /** 已进化为超武（满级后选择超武进化卡获得） */
+  evolved?: boolean;
 }
 
 export interface WeaponDef {
@@ -36,6 +51,10 @@ export interface WeaponDef {
   name: string;
   icon: string;
   maxLevel: number;
+  /** 触发方式：'auto' 自动施放（缺省）；'active' 需玩家鼠标点击触发 */
+  mode?: 'auto' | 'active';
+  /** 超武进化（可选）：满级后升级三选一必出进化卡，选中后质变 */
+  evolve?: { name: string; desc: string };
   /** Description shown for the *next* level (level = level you'd get). */
   describe(level: number): string;
   update(dt: number, ctx: WeaponContext, inst: WeaponInstance): void;
@@ -112,7 +131,7 @@ const WEAPON_DEFS: WeaponDef[] = [
     icon: '🗡️',
     maxLevel: 8,
     describe(level) {
-      if (level === 1) return '召唤在屏幕内乱飞的飞刀，击中触碰到的敌人。';
+      if (level === 1) return '召唤在你周围乱飞的飞刀，击中触碰到的敌人。';
       const bonuses = ['', '伤害 +56%', '冷却 -30%', '飞刀数 +1、伤害 +43%', '穿透 +2', '飞刀数 +1、伤害 +50%', '飞刀数 +1、冷却 -22%', '伤害 +23%、冷却 -11%'];
       return bonuses[level - 1] ?? '威力提升。';
     },
@@ -127,8 +146,8 @@ const WEAPON_DEFS: WeaponDef[] = [
       if (inst.timer > 0) return;
       inst.timer = cd / ctx.player.stats.attackSpeedMult;
       const p = ctx.player;
-      // Knives are summoned flying in random directions; they roam the screen
-      // (bouncing off its edges, handled in the game loop) and hit enemies on contact.
+      // Knives are summoned flying in random directions; they roam a fixed circle
+      // around the player (bouncing off its rim, handled in the game loop).
       for (let i = 0; i < total; i++) {
         const ang = Math.random() * Math.PI * 2;
         const speed = W.dagger.speed * p.stats.projectileSpeedMult;
@@ -473,6 +492,127 @@ const WEAPON_DEFS: WeaponDef[] = [
       );
     },
   },
+
+  // 10. Blade of Dawn (melee) — sweep a cone toward the nearest enemy.
+  {
+    id: 'sword',
+    name: '破晓之刃',
+    icon: '⚔️',
+    maxLevel: 8,
+    describe(level) {
+      if (level === 1) return '朝最近的敌人挥出一道剑气，瞬时斩击扇形区内所有敌人。';
+      const bonuses = ['', '伤害 +57%', '冷却 -19%、范围 +17%', '伤害 +45%', '冷却 -17%、范围 +15%', '伤害 +44%', '冷却 -17%、范围 +15%', '伤害 +30%、范围 +11%、冷却 -15%'];
+      return bonuses[level - 1] ?? '威力提升。';
+    },
+    update(dt, ctx, inst) {
+      const L = inst.level;
+      const cd = W.sword.cd[L];
+      const p = ctx.player;
+      const dmg = W.sword.dmg[L] * p.stats.damageMult;
+      const reach = W.sword.reach[L] * p.stats.areaMult;
+      inst.timer -= dt;
+      if (inst.timer > 0) return;
+      inst.timer = cd / p.stats.attackSpeedMult;
+      // 朝最近敌人挥砍；无敌人时朝面向。
+      const target = ctx.nearestEnemy(p.x, p.y);
+      const ang = target
+        ? angleTo(p.x, p.y, target.x, target.y)
+        : Math.atan2(p.facing.y, p.facing.x);
+      ctx.meleeSwing(p.x, p.y, ang, reach, W.sword.arcHalf, dmg, W.sword.knockback);
+    },
+  },
+
+  // 11. Laser Cannon (ACTIVE) — click to fire a piercing beam toward the cursor.
+  {
+    id: 'laser',
+    name: '激光炮',
+    icon: '🔫',
+    maxLevel: 8,
+    mode: 'active',
+    evolve: {
+      name: '棱镜歼灭',
+      desc: '光束分裂为三道扇形齐射，一发贯穿整个战场。',
+    },
+    describe(level) {
+      if (level === 1) return '鼠标左键点击，朝光标方向发射贯穿光束，重创线路上所有敌人。';
+      const bonuses = ['', '伤害 +50%', '冷却 -16%、光束加粗', '伤害 +43%', '冷却 -15%、光束加粗', '伤害 +37%', '冷却 -17%、光束加粗', '伤害 +32%、冷却 -21%、光束加粗'];
+      return bonuses[level - 1] ?? '威力提升。';
+    },
+    update(dt, ctx, inst) {
+      const L = inst.level;
+      inst.timer -= dt;
+      if (inst.timer > 0) return;
+      // 就绪后等待玩家点击发射（不自动开火）
+      if (!ctx.fireJustPressed()) return;
+      const p = ctx.player;
+      inst.timer = W.laser.cd[L] / p.stats.attackSpeedMult;
+      const aim = ctx.aimWorld();
+      const ang = angleTo(p.x, p.y, aim.x, aim.y);
+      const dmg = W.laser.dmg[L] * p.stats.damageMult;
+      const halfW = W.laser.width[L] * p.stats.areaMult;
+      // 超武「棱镜歼灭」：三束扇形齐射（单束伤害不变）
+      if (inst.evolved) {
+        const spread = W.laser.evoSpread;
+        ctx.laserBlast(p.x, p.y, ang - spread, W.laser.range, halfW, dmg, W.laser.knockback);
+        ctx.laserBlast(p.x, p.y, ang, W.laser.range, halfW, dmg, W.laser.knockback);
+        ctx.laserBlast(p.x, p.y, ang + spread, W.laser.range, halfW, dmg, W.laser.knockback);
+      } else {
+        ctx.laserBlast(p.x, p.y, ang, W.laser.range, halfW, dmg, W.laser.knockback);
+      }
+    },
+  },
+
+  // 12. Annihilation Channel (ACTIVE · channeled) — hold to burn a circle at the cursor.
+  {
+    id: 'channel',
+    name: '湮灭引导',
+    icon: '☄️',
+    maxLevel: 8,
+    mode: 'active',
+    evolve: {
+      name: '湮灭·无终',
+      desc: '引导不再消耗充能；赤色湮灭同时吞噬区域内至多 20 个敌人，将其罩入湮灭领域。',
+    },
+    describe(level) {
+      if (level === 1) return '按住鼠标左键，赤色能量持续灼烧鼠标所在区域；引导消耗充能，松手恢复。';
+      const bonuses = ['', '伤害 +50%', '频率 +14%、范围 +14%、充能 +16%', '伤害 +40%', '频率 +17%、范围 +13%、充能 +16%', '伤害 +38%', '频率 +20%、范围 +13%、充能 +18%', '伤害 +17%、频率 +11%、范围 +13%、充能 +16%'];
+      return bonuses[level - 1] ?? '威力提升。';
+    },
+    update(dt, ctx, inst) {
+      const L = inst.level;
+      const p = ctx.player;
+      const maxE = W.channel.energyMax[L];
+      // 充能槽存在 inst.state：energy 当前能量，locked=1 表示耗尽断线待回充
+      if (inst.state.energy === undefined) inst.state.energy = maxE;
+      // 超武「湮灭·无终」：引导不消耗充能，按住即永续
+      const wantChannel = ctx.fireHeld() && (inst.evolved || (inst.state.locked !== 1 && inst.state.energy > 0));
+      if (!wantChannel) {
+        // 回充；断线后回到阈值解锁
+        inst.state.energy = Math.min(maxE, inst.state.energy + W.channel.regenPerSec * dt);
+        if (inst.state.locked === 1 && inst.state.energy >= maxE * W.channel.rearmFraction) {
+          inst.state.locked = 0;
+        }
+        inst.timer = 0; // 下次按下立即首击
+        return;
+      }
+      // 引导中：消耗能量，耗尽即断线（超武不消耗）
+      if (!inst.evolved) {
+        inst.state.energy = Math.max(0, inst.state.energy - W.channel.drainPerSec * dt);
+        if (inst.state.energy <= 0) inst.state.locked = 1;
+      }
+      const aim = ctx.aimWorld();
+      const radius = W.channel.radius[L] * p.stats.areaMult;
+      inst.timer -= dt;
+      let dealDamage = false;
+      if (inst.timer <= 0) {
+        inst.timer = W.channel.tick[L] / p.stats.attackSpeedMult;
+        dealDamage = true;
+      }
+      const dmg = W.channel.dmg[L] * p.stats.damageMult;
+      // 超武：区域内至多同时选定 evoMaxTargets 个目标（无限引导的平衡刹车）
+      ctx.channel(aim.x, aim.y, radius, dmg, W.channel.knockback, dealDamage, inst.evolved ? W.channel.evoMaxTargets : undefined);
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -482,13 +622,13 @@ const WEAPON_DEFS: WeaponDef[] = [
 const PASSIVE_DEFS: PassiveDef[] = [
   { id: 'max_hp', name: '强健体魄', icon: '❤️', maxLevel: PT.maxLevels.max_hp, describe: () => `最大生命值 +${PT.maxHpPerLevel}，并回复相应生命。` },
   { id: 'move_speed', name: '疾风之靴', icon: '👟', maxLevel: PT.maxLevels.move_speed, describe: () => `移动速度 +${Math.round(PT.moveSpeedPerLevel * 100)}%。` },
-  { id: 'power', name: '力量核心', icon: '💥', maxLevel: PT.maxLevels.power, describe: () => `所有伤害 +${Math.round(PT.powerPerLevel * 100)}%。` },
+  { id: 'power', name: '力量核心', icon: '💪', maxLevel: PT.maxLevels.power, describe: () => `所有伤害 +${Math.round(PT.powerPerLevel * 100)}%。` },
   { id: 'haste', name: '急速引擎', icon: '⏩', maxLevel: PT.maxLevels.haste, describe: () => `攻击速度 +${Math.round(PT.hastePerLevel * 100)}%。` },
   { id: 'area', name: '扩张法阵', icon: '🌀', maxLevel: PT.maxLevels.area, describe: () => `技能范围 +${Math.round(PT.areaPerLevel * 100)}%。` },
   { id: 'magnet', name: '磁力护符', icon: '🧲', maxLevel: PT.maxLevels.magnet, describe: (level) => (level >= PT.maxLevels.magnet ? '拾取范围覆盖全屏！' : '大幅提升拾取范围。') },
   { id: 'wisdom', name: '智慧宝石', icon: '📘', maxLevel: PT.maxLevels.wisdom, describe: () => `经验获取 +${Math.round(PT.xpPerLevel * 100)}%。` },
   { id: 'regen', name: '生命源泉', icon: '✨', maxLevel: PT.maxLevels.regen, describe: () => `每秒回复生命 +${PT.regenPerLevel}。` },
-  { id: 'armor', name: '坚固护甲', icon: '🛡️', maxLevel: PT.maxLevels.armor, describe: () => `受到伤害减少 ${PT.armorPerLevel} 点。` },
+  { id: 'armor', name: '坚固护甲', icon: '🛡️', maxLevel: PT.maxLevels.armor, describe: () => `护甲 +${PT.armorPerLevel}，减免受到的伤害。` },
   { id: 'crit', name: '致命一击', icon: '🎯', maxLevel: PT.maxLevels.crit, describe: () => `暴击率 +${Math.round(PT.critPerLevel * 100)}%（满级 100%）。` },
 ];
 
@@ -517,11 +657,12 @@ export function recomputeStats(player: Player): void {
   const lv = (id: string) => player.passives.get(id) ?? 0;
 
   const oldMax = s.maxHp;
-  s.maxHp = PLAYER.maxHp + PT.maxHpPerLevel * lv('max_hp');
-  s.moveSpeed = PLAYER.moveSpeed * (1 + PT.moveSpeedPerLevel * lv('move_speed'));
+  const cm = CHARACTERS[player.charId].mods;
+  s.maxHp = PLAYER.maxHp + PT.maxHpPerLevel * lv('max_hp') + cm.hpAdd;
+  s.moveSpeed = PLAYER.moveSpeed * (1 + PT.moveSpeedPerLevel * lv('move_speed')) * cm.moveMul;
   s.damageMult = 1 * (1 + PT.powerPerLevel * lv('power'));
-  s.attackSpeedMult = 1 * (1 + PT.hastePerLevel * lv('haste'));
-  s.areaMult = 1 * (1 + PT.areaPerLevel * lv('area'));
+  s.attackSpeedMult = (1 + PT.hastePerLevel * lv('haste')) * cm.hasteMul;
+  s.areaMult = (1 + PT.areaPerLevel * lv('area')) * cm.areaMul;
   // Pickup radius grows fast and covers the whole screen at max level.
   const magnetRadii = PT.magnetRadii;
   s.pickupRadius = magnetRadii[Math.min(lv('magnet'), magnetRadii.length - 1)];
@@ -542,7 +683,7 @@ export function recomputeStats(player: Player): void {
 // Level-up choice generation
 // ---------------------------------------------------------------------------
 
-export type ChoiceType = 'new-weapon' | 'upgrade-weapon' | 'new-passive' | 'upgrade-passive';
+export type ChoiceType = 'new-weapon' | 'upgrade-weapon' | 'new-passive' | 'upgrade-passive' | 'evolve-weapon';
 
 export interface Choice {
   type: ChoiceType;
@@ -553,6 +694,8 @@ export interface Choice {
   tagClass: string;
   desc: string;
   levelText: string;
+  /** 武器触发方式徽章：'active' 主动 / 'auto' 自动；被动增益无此字段 */
+  mode?: 'auto' | 'active';
 }
 
 const MAX_WEAPON_SLOTS = PROGRESSION.maxWeaponSlots;
@@ -561,14 +704,35 @@ export function generateChoices(
   player: Player,
   weapons: WeaponInstance[],
 ): Choice[] {
-  const pool: Choice[] = [];
   const weaponLevels = new Map(weapons.map((w) => [w.defId, w.level]));
+
+  // 新武器单独分组，便于前期对其做保底
+  const newWeapons: Choice[] = [];
+  const others: Choice[] = [];
+  // 超武进化卡：满级且未进化的可进化武器，必定出现在本次三选一中
+  const evolutions: Choice[] = [];
+  for (const inst of weapons) {
+    const def = getWeaponDef(inst.defId);
+    if (def.evolve && inst.level >= def.maxLevel && !inst.evolved) {
+      evolutions.push({
+        type: 'evolve-weapon',
+        id: def.id,
+        name: def.evolve.name,
+        icon: def.icon,
+        tag: '超武进化',
+        tagClass: 'tag-evo',
+        desc: def.evolve.desc,
+        levelText: `Lv.${def.maxLevel} → EX`,
+        mode: def.mode ?? 'auto',
+      });
+    }
+  }
 
   // Upgrade existing weapons
   for (const inst of weapons) {
     const def = getWeaponDef(inst.defId);
     if (inst.level < def.maxLevel) {
-      pool.push({
+      others.push({
         type: 'upgrade-weapon',
         id: def.id,
         name: def.name,
@@ -577,25 +741,35 @@ export function generateChoices(
         tagClass: 'tag-up',
         desc: def.describe(inst.level + 1),
         levelText: `Lv.${inst.level} → ${inst.level + 1}`,
+        mode: def.mode ?? 'auto',
       });
     }
   }
 
   // New weapons (if there is a free slot)
   if (weapons.length < MAX_WEAPON_SLOTS) {
+    // 职业专属初始武器：其他职业的初始武器不进入抽卡池（职业身份独一无二）
+    const own = CHARACTERS[player.charId].startingWeapon;
+    const exclusive = new Set<string>();
+    for (const c of Object.values(CHARACTERS)) {
+      if (c.startingWeapon !== own) exclusive.add(c.startingWeapon);
+    }
+    // 每局只能拥有一个主动武器（避免右手操作过载）：已持有主动武器时不再提供新的主动武器
+    const hasActive = weapons.some((w) => getWeaponDef(w.defId).mode === 'active');
     for (const def of WEAPON_DEFS) {
-      if (!weaponLevels.has(def.id)) {
-        pool.push({
-          type: 'new-weapon',
-          id: def.id,
-          name: def.name,
-          icon: def.icon,
-          tag: '新武器',
-          tagClass: 'tag-weapon',
-          desc: def.describe(1),
-          levelText: '解锁 Lv.1',
-        });
-      }
+      if (weaponLevels.has(def.id) || exclusive.has(def.id)) continue;
+      if (hasActive && def.mode === 'active') continue;
+      newWeapons.push({
+        type: 'new-weapon',
+        id: def.id,
+        name: def.name,
+        icon: def.icon,
+        tag: '新武器',
+        tagClass: 'tag-weapon',
+        desc: def.describe(1),
+        levelText: '解锁 Lv.1',
+        mode: def.mode ?? 'auto',
+      });
     }
   }
 
@@ -603,7 +777,7 @@ export function generateChoices(
   for (const def of PASSIVE_DEFS) {
     const cur = player.passives.get(def.id) ?? 0;
     if (cur < def.maxLevel) {
-      pool.push({
+      others.push({
         type: cur === 0 ? 'new-passive' : 'upgrade-passive',
         id: def.id,
         name: def.name,
@@ -616,12 +790,37 @@ export function generateChoices(
     }
   }
 
-  // Shuffle and take up to 3, preferring a mix.
-  for (let i = pool.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [pool[i], pool[j]] = [pool[j], pool[i]];
+  // 前期新武器保底（见 PROGRESSION.earlyBias）：首抽全新武器，前几级至少 min 个
+  const n = PROGRESSION.choicesPerLevel;
+  const eb = PROGRESSION.earlyBias;
+  let minNew = 0;
+  if (player.level <= eb.allNewUntil) minNew = n;
+  else if (player.level <= eb.until) minNew = eb.min;
+  minNew = Math.min(minNew, newWeapons.length);
+
+  shuffle(newWeapons);
+  // 组装：超武进化卡优先入选，其次前期新武器保底，余位随机补齐
+  const result = evolutions.slice(0, n);
+  for (const c of newWeapons.slice(0, minNew)) {
+    if (result.length >= n) break;
+    result.push(c);
   }
-  return pool.slice(0, PROGRESSION.choicesPerLevel);
+  const taken = new Set(result);
+  const rest = [...others, ...newWeapons.filter((c) => !taken.has(c))];
+  shuffle(rest);
+  for (const c of rest) {
+    if (result.length >= n) break;
+    result.push(c);
+  }
+  shuffle(result); // 保底项不固定排在前面
+  return result;
+}
+
+function shuffle<T>(arr: T[]): void {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
 }
 
 export { dist };

@@ -31,6 +31,13 @@ export const XP_CURVE = { base: 4, linear: 2.4, quad: 0.2 };
 export const PROGRESSION = {
   maxWeaponSlots: 9, // 最多同时持有的武器数
   choicesPerLevel: 3, // 每次升级给几个可选项
+  // 前期新武器保底：build 未成形时新武器的边际价值远高于升级/被动，
+  // 且首抽全新武器让玩家做“构筑方向”的选择，避免开局连抽被动的挫败感。
+  earlyBias: {
+    allNewUntil: 2, // 玩家等级 ≤ 此值时，选项全部是新武器（首次升级即 level 2）
+    until: 5, // 玩家等级 ≤ 此值时，至少保底 min 个新武器选项
+    min: 2,
+  },
 };
 
 // -----------------------------------------------------------------------------
@@ -38,14 +45,20 @@ export const PROGRESSION = {
 // 所有缩放都在 rampSeconds 秒内从 1x 平滑增长到各自的上限。
 // -----------------------------------------------------------------------------
 export const DIFFICULTY = {
-  rampSeconds: 500, // 多少秒爬到最高难度
+  rampSeconds: 420, // 基础线性增长在 0~7 分钟内走完，之后进入类指数后期增长
   spawnBaseInterval: 0.6, // 初始出怪间隔（秒），越小出怪越快
-  hpMaxScale: 40, // 怪物血量最高倍数
-  speedMaxScale: 3, // 怪物移速最高倍数
+  hpMaxScale: 40, // 怪物血量最高倍数（线性段终点）
+  speedMaxScale: 3, // 怪物移速最高倍数（移速不参与后期指数，否则不可玩）
   spawnRateMax: 10, // 出怪速度最高倍数
   batchStepSeconds: 60, // 每隔多少秒，每波多出 1 只
   batchMax: 4, // 每波最多出几只
   bossIntervalSeconds: 50, // 每隔多少秒出一个 Boss
+  dmgMaxScale: 2.5, // 怪物攻击力最高倍数（线性段终点）
+  // 后期类指数增长：rampSeconds 之后按分钟复利叠乘（血量主压力轴，攻击温和防一刀秒）
+  lateGrowth: {
+    hpPerMinute: 1.35, // 满 ramp 后血量每分钟 ×1.35（Boss 同样适用）
+    dmgPerMinute: 1.12, // 满 ramp 后攻击每分钟 ×1.12
+  },
   bossHpStepPerMinute: 0.55, // Boss 血量随分钟数递增的系数
   controlResistBoss: 0.4, // Boss 对减速/眩晕的抗性（越小越抗）
   // 掠过屏幕的怪群（踩踏事件）
@@ -84,7 +97,8 @@ export const PASSIVES = {
   areaPerLevel: 0.16, // 扩张法阵：每级 +范围%
   xpPerLevel: 0.2, // 智慧宝石：每级 +经验%
   regenPerLevel: 1.5, // 生命源泉：每级 +每秒回血
-  armorPerLevel: 3, // 坚固护甲：每级 +减伤
+  armorPerLevel: 3, // 坚固护甲：每级 +护甲值（百分比减伤机制）
+  armorDmgRatio: 0.2, // 护甲减伤系数 K：reduction = armor / (armor + K * enemyDamage)
   critPerLevel: 0.12, // 致命一击：每级 +暴击率（会被 clamp 到 100%）
   magnetRadii: [70, 170, 320, 520, 820, 100000], // 磁力护符：下标=等级
   maxLevels: {
@@ -123,7 +137,7 @@ export const WEAPONS = {
     life: 1.6,
     knockback: 90,
   },
-  // 回旋飞刀：召唤在屏幕内乱飞的飞刀
+  // 回旋飞刀：召唤在玩家周围圆形区域内乱飞的飞刀
   dagger: {
     cd: [0, 0.66, 0.66, 0.46, 0.46, 0.46, 0.46, 0.36, 0.32],
     dmg: [0, 18, 28, 28, 40, 40, 60, 60, 74],
@@ -135,6 +149,7 @@ export const WEAPONS = {
     radius: 6,
     life: 3.6,
     knockback: 70,
+    roamRadius: 1100, // 巡游圆半径（世界像素，以玩家为圆心），与窗口尺寸无关
   },
   // 守护法球：环绕自身旋转
   orbit: {
@@ -217,16 +232,94 @@ export const WEAPONS = {
     expand: 0.4,
     knockback: 300,
   },
+  // 破晓之刃（近战）：朝最近敌人挥斜一个扇形区，瞬时命中扇内所有敌人（剑客初始武器）
+  //   arcHalf 为扇形半张角（弧度）；reach 随等级与范围加成。
+  sword: {
+    cd: [0, 0.72, 0.72, 0.58, 0.58, 0.48, 0.48, 0.4, 0.34],
+    dmg: [0, 28, 44, 44, 64, 64, 92, 92, 120],
+    reach: [0, 92, 92, 108, 108, 124, 124, 142, 158],
+    arcHalf: 0.95, // 半张角 ~54°（全张角 ~108°）
+    knockback: 170,
+  },
+  // 激光炮（主动）：鼠标左键点击画布，朝光标方向瞬发一道贯穿光束，
+  // 命中线路内所有敌人。长冷却高爆发，是唯一需要右手操作的武器。
+  laser: {
+    cd: [0, 1.6, 1.6, 1.35, 1.35, 1.15, 1.15, 0.95, 0.75],
+    dmg: [0, 70, 105, 105, 150, 150, 205, 205, 270],
+    width: [0, 10, 10, 13, 13, 16, 16, 20, 24], // 光束半宽（受范围加成）
+    range: 950, // 射程（世界像素）
+    knockback: 120,
+    evoSpread: 0.38, // 超武「棱镜歼灭」三束齐射的相邻夹角（弧度，约 22°）
+  },
+  // 湮灭引导（主动·持续引导）：按住鼠标左键，赤色能量从主角飞向光标，
+  // 持续灼烧以鼠标为中心的圆形区域（按 tick 间隔结算）。
+  // 充能槽机制：引导持续消耗能量（用多少扣多少），松手恒速回充；
+  // 耗尽后断线，需回充到 rearmFraction 才能再次引导（防 0 点抖动蹭伤害）。
+  channel: {
+    tick: [0, 0.16, 0.16, 0.14, 0.14, 0.12, 0.12, 0.1, 0.09], // 每次结算间隔（秒），受攻速影响
+    dmg: [0, 10, 15, 15, 21, 21, 29, 29, 34], // 每次结算伤害
+    radius: [0, 84, 84, 96, 96, 108, 108, 122, 138], // 灼烧圆半径（受范围加成）
+    energyMax: [0, 100, 100, 116, 116, 134, 134, 158, 184], // 充能槽上限（决定可连续引导时长）
+    drainPerSec: 34, // 引导每秒消耗（Lv.1 约可连续引导 3 秒）
+    regenPerSec: 14, // 非引导时恒定每秒回充
+    rearmFraction: 0.25, // 耗尽后需回充到此比例才能再引导
+    evoMaxTargets: 20, // 超武「湮灭·无终」：区域内每次至多同时选定的目标数
+    knockback: 40,
+  },
 };
 
 // -----------------------------------------------------------------------------
 // 游戏模式 (Game modes)
 // -----------------------------------------------------------------------------
-export type GameMode = 'endless' | 'timed';
+export type GameMode = 'endless' | 'timed' | 'training';
 
 export const GAME_MODES = {
   endless: { name: '无尽模式', desc: '在无尽敌潮中生存尽可能久' },
   timed: { name: '限时模式', desc: '存活 10 分钟即获胜', duration: 600 },
+  training: { name: '训练模式', desc: '自选武器与等级，测试专用' },
+};
+
+// -----------------------------------------------------------------------------
+// 可选角色 (Characters)
+// 每个角色有不同的初始武器、标志性装扮（由 renderer 绘制）与基础属性微调。
+//   startingWeapon：开局自带的武器 id（对应 skills.ts 中的武器）
+//   mods：基础属性修正（hpAdd 加最大生命，moveMul 乘移速），在 recomputeStats 中应用
+// -----------------------------------------------------------------------------
+export type CharacterId = 'mage' | 'swordsman';
+
+export interface CharacterMods {
+  hpAdd: number; // 基础最大生命加成
+  moveMul: number; // 移动速度乘数
+  hasteMul: number; // 施法速度乘数（所有武器冷却除以此值）
+  areaMul: number; // 技能范围乘数
+}
+
+export interface CharacterDef {
+  name: string;
+  desc: string;
+  icon: string; // 菜单显示的 emoji
+  startingWeapon: string;
+  trait: string; // 特性说明
+  mods: CharacterMods;
+}
+
+export const CHARACTERS: Record<CharacterId, CharacterDef> = {
+  mage: {
+    name: '法师',
+    desc: '施法快、范围广，远程压制',
+    icon: '🧙',
+    startingWeapon: 'bolt',
+    trait: '初始：魔法飞弹 · 施法速度 +12% · 技能范围 +10%',
+    mods: { hpAdd: 0, moveMul: 1, hasteMul: 1.12, areaMul: 1.1 },
+  },
+  swordsman: {
+    name: '剑客',
+    desc: '近战挥斩，血厚移速快',
+    icon: '⚔️',
+    startingWeapon: 'sword',
+    trait: '初始：破晓之刃 · +20 生命 · +12% 移速',
+    mods: { hpAdd: 20, moveMul: 1.12, hasteMul: 1, areaMul: 1 },
+  },
 };
 
 // -----------------------------------------------------------------------------
@@ -301,5 +394,31 @@ export const MAPS: Record<MapId, MapDef> = {
     decoChance: 0.55,
     decoDouble: 0.25,
     obstacle: { chance: 0.58, scaleMin: 0.85, scaleMax: 1.25 },
+  },
+};
+
+// -----------------------------------------------------------------------------
+// 可破坏道具 (Destructibles)
+// 独立于确定性障碍物系统的可打碎物件（各地图不同造型）：
+//   按格子哈希稀疏生成，有 HP，只阻挡玩家；被武器投射物打碎后按小概率掉落收益。
+//   drop 各项概率独立判定：多数道具碎后无收益（纯视觉），少数掉经验/血包/爆炸。
+// -----------------------------------------------------------------------------
+export const DESTRUCTIBLES = {
+  cell: 460, // 生成大格尺寸（px，比障碍物更稀），每格至多 1 个
+  chance: 0.42, // 每格生成概率
+  safeRadius: 240, // 世界原点（出生点）周围不生成的半径
+  hp: 26, // 道具生命（一两下即碎）
+  radius: 19, // 碰撞 / 受击半径
+  cullRadius: 1500, // 超出玩家此距离的道具从活动列表移除（未破坏者重新靠近时确定性重建）
+  // 碎后掉落（各项独立判定，概率均偏小）
+  drop: {
+    xpChance: 0.3, // 掉经验宝石的概率
+    xpValue: 4, // 经验宝石数值
+    healChance: 0.05, // 掉血包的概率
+    healAmount: 25, // 血包回复生命
+    explodeChance: 0.05, // 碎时爆炸的概率
+    explodeRadius: 130, // 爆炸最大半径
+    explodeDamage: 48, // 爆炸伤害
+    explodeKnockback: 240, // 爆炸击退
   },
 };
