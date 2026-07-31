@@ -22,6 +22,19 @@ export class Spawner {
     this.bossTimers.clear();
   }
 
+  /**
+   * 直接跳转游戏时钟（训练模式测试特定时间点的怪物强度）。
+   * 难度缩放由 this.time 驱动，改时间即改难度；
+   * 将已过分钟标记为已用，避免前跳时一次性补刷多个 Boss。
+   */
+  setTime(t: number): void {
+    this.time = Math.max(0, t);
+    this.timer = 0; // 新难度下尽快出下一波
+    this.bossTimers.clear();
+    const passed = Math.floor(this.time / DIFFICULTY.bossIntervalSeconds);
+    for (let m = 1; m <= passed; m++) this.bossTimers.add(m);
+  }
+
   /** 0..1 progress toward the difficulty caps (reached at rampSeconds). */
   private ramp(): number {
     return Math.min(1, this.time / DIFFICULTY.rampSeconds);

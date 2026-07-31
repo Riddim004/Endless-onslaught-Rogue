@@ -31,6 +31,7 @@ export const XP_CURVE = { base: 4, linear: 2.4, quad: 0.2 };
 export const PROGRESSION = {
   maxWeaponSlots: 9, // 最多同时持有的武器数
   choicesPerLevel: 3, // 每次升级给几个可选项
+  maxRerolls: 3, // 整局最多重随次数（跨升级共用，每局开局重置）
   // 前期新武器保底：build 未成形时新武器的边际价值远高于升级/被动，
   // 且首抽全新武器让玩家做“构筑方向”的选择，避免开局连抽被动的挫败感。
   earlyBias: {

@@ -15,11 +15,12 @@ import {
   createProjectile,
 } from './entities';
 import { Input } from './input';
-import { Renderer, Beam, Slash, slashGeometry } from './renderer';
+import { Renderer, Beam, Slash, slashGeometry, ChannelFx } from './renderer';
 import { Spawner } from './spawner';
 import { DestructibleField } from './destructibles';
+import { SpatialGrid } from './spatial';
 import { UI, TrainLoadoutItem } from './ui';
-import { angleTo, clamp, pick, rand } from './math';
+import { angleTo, clamp, pick, rand, formatTime } from './math';
 import {
   Choice,
   WeaponContext,
@@ -40,8 +41,10 @@ import {
   CHARACTERS,
   PASSIVES,
   WEAPONS,
+  PROGRESSION,
 } from './config';
 import { audio } from './audio';
+import { meta, RunResult } from './meta';
 
 type State = 'menu' | 'playing' | 'levelup' | 'paused' | 'gameover';
 
@@ -67,7 +70,7 @@ export class Game implements WeaponContext {
   slashes: Slash[] = [];
   weapons: WeaponInstance[] = [];
   /** 本帧持续引导灼烧区（湮灭引导激活时），每帧重置；targets 为超武选定目标位置 */
-  private channelFx: { x: number; y: number; radius: number; targets: { x: number; y: number }[] | null } | null = null;
+  private channelFx: ChannelFx | null = null;
 
   private state: State = 'menu';
   private gameMode: GameMode = 'endless';
@@ -76,12 +79,14 @@ export class Game implements WeaponContext {
   private slashDir: 1 | -1 = 1; // 近战挥砍方向（逐次交替）
   /** 训练模式自选装备（非训练模式为 null） */
   private trainLoadout: TrainLoadoutItem[] | null = null;
-  /** 敌人空间哈希网格（每帧重建，供分离/碰撞/范围查询共用） */
-  private enemyGrid = new Map<number, Enemy[]>();
+  /** 本局是否进行中且尚未结算（防止重复发币/漏发币） */
+  private runActive = false;
+  /** 敌人空间哈希网格（每帧重建，供分离/碰撞/范围查询/最近搜索共用，见 spatial.ts） */
+  private grid = new SpatialGrid();
   private kills = 0;
   private shake = 0;
   private pendingLevelUps = 0;
-  private rerollAvailable = true;
+  private rerollsLeft = 0; // 整局剩余重随次数（开局重置为 PROGRESSION.maxRerolls）
   private lastTs = 0;
 
   constructor(canvas: HTMLCanvasElement, uiRoot: HTMLElement) {
@@ -109,6 +114,7 @@ export class Game implements WeaponContext {
     this.kills = 0;
     this.shake = 0;
     this.pendingLevelUps = 0;
+    this.rerollsLeft = PROGRESSION.maxRerolls;
     this.spawner.reset();
     this.destructibleField.reset();
     recomputeStats(this.player);
@@ -135,10 +141,13 @@ export class Game implements WeaponContext {
     this.state = 'menu';
     audio.stopMusic();
     this.ui.setHudVisible(false);
-    this.ui.showStart((mode, map, char, loadout) => {
-      this.trainLoadout = loadout;
-      this.start(mode, this.resolveMap(map), char);
-    });
+    this.ui.showStart(
+      (mode, map, char, loadout) => {
+        this.trainLoadout = loadout;
+        this.start(mode, this.resolveMap(map), char);
+      },
+      () => this.ui.showShop(() => this.showMenu()),
+    );
   }
 
   /** 'random' 时从三张地图中随机取一（每局重随） */
@@ -155,6 +164,7 @@ export class Game implements WeaponContext {
     this.destructibleField.setMap(map);
     this.reset();
     this.state = 'playing';
+    this.runActive = true;
     this.ui.setHudVisible(true);
     audio.startMusic();
   }
@@ -165,8 +175,21 @@ export class Game implements WeaponContext {
     this.destructibleField.setMap(this.mapId);
     this.reset();
     this.state = 'playing';
+    this.runActive = true;
     this.ui.setHudVisible(true);
     audio.startMusic();
+  }
+
+  /**
+   * 结算本局：发放货币与刷新最佳成绩，每局只生效一次（runActive 守卫）。
+   * 死亡、限时胜利、中途退出三条路径共用，避免“退出就丢钱”。
+   * （训练模式同样结算：它是隐藏开发者选项，普通玩家接触不到，无刷分风险。）
+   */
+  private settleRun(): RunResult {
+    const zero = { earned: 0, rank: 0 };
+    if (!this.runActive) return zero;
+    this.runActive = false;
+    return meta.recordRun(this.kills, this.spawner.time, this.player.level, this.charId, this.gameMode);
   }
 
   // ------------------------------------------------------------------
@@ -183,21 +206,26 @@ export class Game implements WeaponContext {
       this.update(dt);
     }
 
-    this.renderer.render({
-      player: this.player,
-      enemies: this.enemies,
-      destructibles: this.destructibleField.active,
-      projectiles: this.projectiles,
-      gems: this.gems,
-      particles: this.particles,
-      texts: this.texts,
-      beams: this.beams,
-      slashes: this.slashes,
-      aim: this.aimState(),
-      channel: this.channelFx,
-      time: this.spawner.time,
-      shake: this.shake,
-    });
+    if (this.state === 'menu') {
+      // 菜单：渲染动态氛围背景（透过毛玻璃覆盖层显示），而非初始静态画面
+      this.renderer.renderMenu(ts / 1000);
+    } else {
+      this.renderer.render({
+        player: this.player,
+        enemies: this.enemies,
+        destructibles: this.destructibleField.active,
+        projectiles: this.projectiles,
+        gems: this.gems,
+        particles: this.particles,
+        texts: this.texts,
+        beams: this.beams,
+        slashes: this.slashes,
+        aim: this.aimState(),
+        channel: this.channelFx,
+        time: this.spawner.time,
+        shake: this.shake,
+      });
+    }
 
     if (this.state === 'playing') {
       this.ui.updateHud({
@@ -222,8 +250,19 @@ export class Game implements WeaponContext {
     requestAnimationFrame((t) => this.loop(t));
   }
 
+  /** 训练模式：跳转游戏时钟并反馈新时间 */
+  private scrubTime(delta: number): void {
+    this.spawner.setTime(this.spawner.time + delta);
+    this.addText(`时间 → ${formatTime(this.spawner.time)}`, this.player.x, this.player.y - 46, '#7df9ff', 18);
+  }
+
   private handleGlobalKeys(): void {
     if (this.input.justPressed('m')) this.ui.toggleMute();
+    // 训练模式：[ / ] 调整游戏时钟（±1 分钟），用于测试特定时间点的怪物强度
+    if (this.gameMode === 'training' && this.state === 'playing') {
+      if (this.input.justPressed('[')) this.scrubTime(-60);
+      if (this.input.justPressed(']')) this.scrubTime(60);
+    }
     if ((this.input.justPressed('p') || this.input.justPressed('escape'))) {
       if (this.state === 'playing') {
         this.state = 'paused';
@@ -234,7 +273,10 @@ export class Game implements WeaponContext {
             audio.duckMusic(false);
           },
           () => this.restart(),
-          () => this.showMenu(),
+          () => {
+            this.settleRun(); // 中途退出也结算，保留本局已得货币与成绩
+            this.showMenu();
+          },
         );
       } else if (this.state === 'paused') {
         this.state = 'playing';
@@ -352,88 +394,24 @@ export class Game implements WeaponContext {
         }
       }
     }
-    this.rebuildEnemyGrid();
-    this.separateEnemies();
+    this.grid.rebuild(this.enemies);
+    this.grid.separate(this.enemies);
   }
 
   // ------------------------------------------------------------------
-  // 敌人空间哈希网格：每帧重建一次，分离/投射物碰撞/玩家碰撞/黑洞等共用，
-  // 避免多处 O(投射物×敌人) 全表扫描。key 用数字避免每帧大量临时字符串。
+  // 敌人空间哈希网格（实现见 spatial.ts）：每帧在 updateEnemies 内重建一次，
+  // 分离 / 投射物碰撞 / 玩家碰撞 / 黑洞 / 最近搜索共用，避免全表扫描。
+  // 保留下面这层薄封装，让各碰撞调用点无需感知 grid。
   // ------------------------------------------------------------------
-  private static readonly GRID_CELL = 48;
-  /** 敌人最大半径（boss 44）+ 网格建成后分离/推离造成的位移宽容 */
-  private static readonly GRID_SLACK = 52;
-
-  private gridKey(cx: number, cy: number): number {
-    return (cx + 32768) * 65536 + (cy + 32768);
-  }
-
-  private rebuildEnemyGrid(): void {
-    this.enemyGrid.clear();
-    const cell = Game.GRID_CELL;
-    for (const e of this.enemies) {
-      const k = this.gridKey(Math.floor(e.x / cell), Math.floor(e.y / cell));
-      let arr = this.enemyGrid.get(k);
-      if (!arr) this.enemyGrid.set(k, (arr = []));
-      arr.push(e);
-    }
-  }
-
   /** 遍历可能与圆 (x,y,r) 相交的敌人（已含敌人半径与位移宽容）；回调返回 true 时提前终止 */
   private forEachEnemyNear(x: number, y: number, r: number, fn: (e: Enemy) => boolean | void): void {
-    const cell = Game.GRID_CELL;
-    const reach = r + Game.GRID_SLACK;
-    const cx0 = Math.floor((x - reach) / cell);
-    const cy0 = Math.floor((y - reach) / cell);
-    const cx1 = Math.floor((x + reach) / cell);
-    const cy1 = Math.floor((y + reach) / cell);
-    for (let cx = cx0; cx <= cx1; cx++) {
-      for (let cy = cy0; cy <= cy1; cy++) {
-        const arr = this.enemyGrid.get(this.gridKey(cx, cy));
-        if (!arr) continue;
-        for (const e of arr) {
-          if (fn(e)) return;
-        }
-      }
-    }
-  }
-
-  /** Light grid-based separation so enemies don't fully overlap. */
-  private separateEnemies(): void {
-    const cell = Game.GRID_CELL;
-    for (const e of this.enemies) {
-      const cx = Math.floor(e.x / cell);
-      const cy = Math.floor(e.y / cell);
-      for (let ox = -1; ox <= 1; ox++) {
-        for (let oy = -1; oy <= 1; oy++) {
-          const arr = this.enemyGrid.get(this.gridKey(cx + ox, cy + oy));
-          if (!arr) continue;
-          for (const o of arr) {
-            if (o === e) continue;
-            const dx = e.x - o.x;
-            const dy = e.y - o.y;
-            const minD = e.radius + o.radius;
-            const d2 = dx * dx + dy * dy;
-            if (d2 > 0 && d2 < minD * minD) {
-              const d = Math.sqrt(d2);
-              const push = (minD - d) * 0.5;
-              const nx = dx / d;
-              const ny = dy / d;
-              e.x += nx * push;
-              e.y += ny * push;
-              o.x -= nx * push;
-              o.y -= ny * push;
-            }
-          }
-        }
-      }
-    }
+    this.grid.forEachNear(x, y, r, fn);
   }
 
   /**
    * 玩家与所有敌人（含踩踏事件 sweep 敌人与 Boss）对地图障碍物做圆形推离；
    * 投射物 / 经验宝石 / 粒子不受阻挡（保持武器手感）。
-   * 在玩家移动与 separateEnemies 之后调用；每个实体只查询自身附近格子的碰撞体。
+   * 在玩家移动与 grid.separate 之后调用；每个实体只查询自身附近格子的碰撞体。
    * 刷新在障碍物内的敌人也靠每帧推离自然挤出（1~2 帧内完成，不可感知）。
    */
   private collideObstacles(): void {
@@ -602,19 +580,15 @@ export class Game implements WeaponContext {
         this.damageEnemy(e, sl.dmg!, sl.x, sl.y, sl.knockback!);
       }
     });
-    for (const d of this.destructibleField.active) {
+    this.forEachDestructibleHit(sl.x, sl.y, g.reach, (d) => {
       const key = DEST_HIT_OFFSET + d.id;
-      if (d.hp <= 0 || sl.hit!.has(key)) continue;
-      const dx = d.cx - sl.x;
-      const dy = d.cy - sl.y;
-      const rr = g.reach + d.r;
-      if (dx * dx + dy * dy > rr * rr) continue;
-      const rel = this.angleDelta(Math.atan2(dy, dx), g.a0) * sl.dir;
+      if (sl.hit!.has(key)) return;
+      const rel = this.angleDelta(Math.atan2(d.cy - sl.y, d.cx - sl.x), g.a0) * sl.dir;
       if (rel >= -tol && rel <= swept + tol) {
         sl.hit!.add(key);
         this.damageDestructible(d, sl.dmg!);
       }
-    }
+    });
   }
 
   // ------------------------------------------------------------------
@@ -651,29 +625,36 @@ export class Game implements WeaponContext {
       });
       if (pr.life <= 0) continue;
       // 投射物也打可破坏道具（穿过道具、不消耗穿透，避免道具替敌人挡弹）
-      for (const d of this.destructibleField.active) {
-        if (d.hp <= 0) continue;
-        const rr = (pr.radius + d.r) ** 2;
-        const dx = pr.x - d.cx;
-        const dy = pr.y - d.cy;
-        if (dx * dx + dy * dy > rr) continue;
+      this.forEachDestructibleHit(pr.x, pr.y, pr.radius, (d) => {
         const key = DEST_HIT_OFFSET + d.id;
         if (pr.rehitInterval > 0) {
-          if (pr.rehit.has(key)) continue;
+          if (pr.rehit.has(key)) return;
           this.damageDestructible(d, pr.damage);
           pr.rehit.set(key, pr.rehitInterval);
         } else {
-          if (pr.hit.has(key)) continue;
+          if (pr.hit.has(key)) return;
           this.damageDestructible(d, pr.damage);
           pr.hit.add(key);
         }
-      }
+      });
     }
   }
 
   // ------------------------------------------------------------------
   // 可破坏道具
   // ------------------------------------------------------------------
+  /** 遍历与圆 (x,y,r) 相交的存活道具（各战斗方法共用；回调返回 true 提前终止） */
+  private forEachDestructibleHit(x: number, y: number, r: number, fn: (d: Destructible) => boolean | void): void {
+    for (const d of this.destructibleField.active) {
+      if (d.hp <= 0) continue;
+      const dx = d.cx - x;
+      const dy = d.cy - y;
+      const rr = r + d.r;
+      if (dx * dx + dy * dy > rr * rr) continue;
+      if (fn(d)) return;
+    }
+  }
+
   /** 生成/剔除跟随玩家的道具，并衰减受击白闪 */
   private updateDestructibles(dt: number): void {
     this.destructibleField.update(this.player.x, this.player.y);
@@ -776,19 +757,8 @@ export class Game implements WeaponContext {
     this.projectiles = this.projectiles.filter((p) => p.kind !== kind);
   }
 
-  nearestEnemy(x: number, y: number, exclude?: Set<number>): Enemy | null {
-    let best: Enemy | null = null;
-    let bestD = Infinity;
-    for (const e of this.enemies) {
-      if (e.hp <= 0) continue;
-      if (exclude && exclude.has(e.id)) continue;
-      const d2 = (e.x - x) ** 2 + (e.y - y) ** 2;
-      if (d2 < bestD) {
-        bestD = d2;
-        best = e;
-      }
-    }
-    return best;
+  nearestEnemy(x: number, y: number, exclude?: Set<number>, maxDist?: number): Enemy | null {
+    return this.grid.nearest(x, y, exclude, maxDist);
   }
 
   damageEnemy(e: Enemy, dmg: number, fromX: number, fromY: number, knockback: number): void {
@@ -900,13 +870,7 @@ export class Game implements WeaponContext {
         });
       }
       // 道具不占目标名额，圈内照常灼烧
-      for (const d of this.destructibleField.active) {
-        if (d.hp <= 0) continue;
-        const dx = d.cx - ax;
-        const dy = d.cy - ay;
-        const rr = radius + d.r;
-        if (dx * dx + dy * dy <= rr * rr) this.damageDestructible(d, dmg);
-      }
+      this.forEachDestructibleHit(ax, ay, radius, (d) => this.damageDestructible(d, dmg));
       // 灼烧冲击粒子
       this.spawnParticles(ax + rand(-radius * 0.4, radius * 0.4), ay + rand(-radius * 0.4, radius * 0.4), '#ff6b5a', 4, 120);
     }
@@ -964,6 +928,7 @@ export class Game implements WeaponContext {
     this.slashDir = this.slashDir === 1 ? -1 : 1;
     this.player.attackAnim = 0.2; // 触发挥剑动画
     this.player.attackDir = this.slashDir;
+    this.player.attackAngle = angle; // 持剑朝向与剑气同源，避免“剑往前、剑气在后”
     // 剑光实体：伤害不在此处瞬时结算，而由 updateSlashes 随刃光扫过持续判定，
     // 避免“剑气看着能盖到但没伤害”的错位感。
     const sl: Slash = {
@@ -1054,7 +1019,6 @@ export class Game implements WeaponContext {
       audio.duckMusic(true);
     }
     this.state = 'levelup';
-    this.rerollAvailable = true; // one free re-roll per level-up
     this.presentChoices();
   }
 
@@ -1068,13 +1032,14 @@ export class Game implements WeaponContext {
       audio.duckMusic(false);
       return;
     }
-    const onReroll = this.rerollAvailable
-      ? () => {
-          this.rerollAvailable = false;
-          this.presentChoices();
-        }
-      : null;
-    this.ui.showLevelUp(choices, (c) => this.applyChoice(c), onReroll);
+    const onReroll =
+      this.rerollsLeft > 0
+        ? () => {
+            this.rerollsLeft -= 1;
+            this.presentChoices();
+          }
+        : null;
+    this.ui.showLevelUp(choices, (c) => this.applyChoice(c), onReroll, this.rerollsLeft);
   }
 
   private applyChoice(c: Choice): void {
@@ -1121,8 +1086,10 @@ export class Game implements WeaponContext {
     this.state = 'gameover';
     audio.stopMusic();
     this.ui.setHudVisible(false);
+    // 本局结算（发币+记录最佳，只生效一次）
+    const run = this.settleRun();
     this.ui.showGameOver(
-      { time: this.spawner.time, level: this.player.level, kills: this.kills, victory },
+      { time: this.spawner.time, level: this.player.level, kills: this.kills, victory, run },
       () => this.restart(),
       () => this.showMenu(),
     );

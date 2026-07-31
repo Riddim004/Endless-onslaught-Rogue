@@ -53,6 +53,7 @@ export interface Player {
   charId: CharacterId; // 所选角色（决定初始武器/装扮/基础属性修正）
   attackAnim: number; // 攻击动作计时（剑客挥剑时刷新，供渲染控制剑光动画）
   attackDir: 1 | -1; // 本次挥砍扫动方向（与剑光同步）
+  attackAngle: number; // 本次挥砍的中心朝向（与剑气同源，供持剑渲染）
 }
 
 export function createPlayer(x: number, y: number, charId: CharacterId = 'mage'): Player {
@@ -73,6 +74,7 @@ export function createPlayer(x: number, y: number, charId: CharacterId = 'mage')
     charId,
     attackAnim: 0,
     attackDir: 1,
+    attackAngle: 0,
   };
 }
 

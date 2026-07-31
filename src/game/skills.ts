@@ -18,7 +18,7 @@ export interface WeaponContext {
   enemies: Enemy[];
   spawnProjectile(p: Projectile): void;
   clearProjectiles(kind: ProjectileKind): void;
-  nearestEnemy(x: number, y: number, exclude?: Set<number>): Enemy | null;
+  nearestEnemy(x: number, y: number, exclude?: Set<number>, maxDist?: number): Enemy | null;
   damageEnemy(e: Enemy, dmg: number, fromX: number, fromY: number, knockback: number): void;
   applyStatus(e: Enemy, slowMul: number, slowDuration: number, stunDuration: number): void;
   addBeam(x1: number, y1: number, x2: number, y2: number, color: string): void;
@@ -345,18 +345,8 @@ const WEAPON_DEFS: WeaponDef[] = [
         hitSet.add(current.id);
         fromX = current.x;
         fromY = current.y;
-        // find next nearest unhit enemy within range
-        let next: Enemy | null = null;
-        let best = range * range;
-        for (const e of ctx.enemies) {
-          if (hitSet.has(e.id) || e.hp <= 0) continue;
-          const d = (e.x - fromX) ** 2 + (e.y - fromY) ** 2;
-          if (d < best) {
-            best = d;
-            next = e;
-          }
-        }
-        current = next;
+        // 网格最近搜索：跳过已击中者、限定在弹跳射程内
+        current = ctx.nearestEnemy(fromX, fromY, hitSet, range);
       }
     },
   },
